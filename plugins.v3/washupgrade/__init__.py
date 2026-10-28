@@ -1,8 +1,10 @@
 import random
+import re
 import time
 from datetime import datetime
 from threading import Thread
 from typing import Any
+from urllib.parse import quote
 
 from apscheduler.triggers.cron import CronTrigger
 
@@ -76,7 +78,7 @@ class WashUpgrade(_PluginBase):
     plugin_name = "洗版自用"
     plugin_desc = "评分洗版：原生最佳版本触发，或自选类别打分覆盖 MP 原生规则。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.4.5"
+    plugin_version = "1.4.6"
     plugin_author = "your-name"
     author_url = "https://github.com/your-name"
     plugin_config_prefix = "washupgrade_"
@@ -102,8 +104,10 @@ class WashUpgrade(_PluginBase):
     _interval_seconds = 60      # 每处理完一个订阅后等待的秒数（含随机抖动）
     _batch_limit = 10           # 每轮最多处理多少个订阅（0 = 不限），其余下轮轮转
     _cooldown_hours = 12        # 同一订阅的冷却小时数，冷却内跳过（0 = 不限）
+    _full_season_only = True    # 自定义模式下，电视剧只在出现「全集/整季」时才洗版
     _cursor = 0                 # 分批轮转起点
     _last_wash_at: dict[int, float] = {}   # 订阅 id -> 上次洗版时间戳
+    _ver_cache: dict[int, tuple[str, float]] = {}   # 订阅 id -> (当前版本标题, 缓存时间)
     _last_run = "尚未运行"
 
     # 内存活动缓存（在「数据」页展示）
@@ -144,11 +148,18 @@ class WashUpgrade(_PluginBase):
         self._interval_seconds = self._to_int(config.get("interval_seconds"), 60, 0, 3600)
         self._batch_limit = self._to_int(config.get("batch_limit"), 10, 0, 500)
         self._cooldown_hours = self._to_int(config.get("cooldown_hours"), 12, 0, 720)
-        # 冷却记录/轮转游标：跨配置重载保留，但每个实例独立一份
+        self._full_season_only = bool(config.get("full_season_only", True))
+        # 冷却记录/轮转游标/版本缓存：跨配置重载保留，但每个实例独立一份
         if "_last_wash_at" not in self.__dict__:
             self._last_wash_at = {}
         if "_cursor" not in self.__dict__:
             self._cursor = 0
+        if "_ver_cache" not in self.__dict__:
+            self._ver_cache = {}
+        if "_best_scores" not in self.__dict__:
+            self._best_scores = {}
+        if "_best_titles" not in self.__dict__:
+            self._best_titles = {}
         self._record("插件已加载 / 重新配置")
         # 「立即运行一次」开关：保存配置时若为开，则触发一次并自动复位为关，避免重启重复执行
         self._run_once = bool(config.get("run_once"))
@@ -189,6 +200,22 @@ class WashUpgrade(_PluginBase):
         except (TypeError, ValueError):
             return default
         return max(low, min(high, v))
+
+    @staticmethod
+    def _is_complete_pack(title: str, total_episode: int = 0) -> bool:
+        """判断资源是否为「全集 / 整季包」（用于电视剧分集转全集）。"""
+        if not title:
+            return False
+        t = title.upper()
+        if any(k in title for k in ("全集", "合集", "全剧", "整季", "完结")):
+            return True
+        if re.search(r"全\s*\d+\s*集", title):
+            return True
+        if total_episode and re.search(rf"全\s*{total_episode}\s*集", title):
+            return True
+        if "COMPLETE" in t or "SEASON PACK" in t or "COMPLETE PACK" in t or "全集" in t:
+            return True
+        return False
 
     @staticmethod
     def _normalize_values(raw: Any, all_vals: list[str]) -> list[str]:
@@ -336,6 +363,13 @@ class WashUpgrade(_PluginBase):
                         },
                     },
                     {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "full_season_only",
+                            "label": "电视剧只在出现「全集/整季」时才洗版（分集转全集，自定义模式生效）",
+                        },
+                    },
+                    {
                         "component": "VTextField",
                         "props": {
                             "model": "crontab",
@@ -471,6 +505,7 @@ class WashUpgrade(_PluginBase):
             "wash_mode": _MODE_NATIVE,
             "scope": _SCOPE_ALL,
             "only_best_version": True,
+            "full_season_only": True,
             "crontab": "0 4 * * *",
             "dry_run": True,
             "run_once": False,
@@ -489,83 +524,204 @@ class WashUpgrade(_PluginBase):
     # 详情页（数据 + 手动触发）
     # ------------------------------------------------------------------ #
     def get_page(self) -> list[dict]:
+        """详情页：海报 + 当前版本的一览式卡片，尽量少文字。"""
         mode_text = "原生最佳版本" if self._wash_mode == _MODE_NATIVE else "自定义类别打分"
-        scope_text = {"all": "全部", "movie": "仅电影", "tv": "仅电视剧"}.get(self._scope, "全部")
-        recent = list(reversed(self._activities[-30:]))
-        return [
-            {
-                "component": "VCard",
-                "props": {"variant": "outlined", "class": "mb-2"},
-                "content": [
-                    {
-                        "component": "VBtn",
-                        "props": {
-                            "color": "primary",
-                            "variant": "elevated",
-                            "text": "立即洗版一次（手动触发）",
-                            "block": True,
-                        },
-                        "events": {
-                            "click": {
-                                "api": f"plugin/{self.__class__.__name__}/run",
-                                "method": "POST",
-                                "params": {},
-                            }
-                        },
-                    },
-                    {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "warning",
-                            "variant": "tonal",
-                            "text": "点击后立即按当前配置洗版一次；受「试运行」开关控制——开启试运行则只记录不实际下载。",
-                        },
-                    },
-                ],
-            },
-            {
+        nodes: list[dict] = [self._trigger_card()]
+        nodes.append({
+            "component": "VCardText",
+            "props": {"class": "pa-0 px-1 pb-3 text-caption text-medium-emphasis"},
+            "text": (
+                f"{'运行中' if self._enabled else '已停用'} · {mode_text} · "
+                f"{'试运行' if self._dry_run else '正式'} · 间隔 {self._interval_seconds}s · "
+                f"每轮 {self._batch_limit or '不限'} · 冷却 {self._cooldown_hours}h"
+            ),
+        })
+
+        subs: list[Any] = []
+        err = ""
+        try:
+            subs = list(SubscribeOper().list() or [])
+        except Exception as e:  # noqa: BLE001
+            err = str(e)
+        if err:
+            nodes.append({
                 "component": "VAlert",
-                "props": {
-                    "type": "info",
-                    "variant": "tonal",
-                    "text": (
-                        f"状态：{'运行中' if self._enabled else '已停用'} | "
-                        f"模式：{mode_text} | "
-                        f"范围：{scope_text} | "
-                        f"仅最佳版本：{'是' if self._only_best_version else '否'} | "
-                        f"试运行：{'是' if self._dry_run else '否'} | "
-                        f"间隔：{self._interval_seconds}s | "
-                        f"每轮上限：{self._batch_limit or '不限'} | "
-                        f"冷却：{self._cooldown_hours}h"
-                    ),
+                "props": {"type": "warning", "variant": "tonal", "text": f"读取订阅失败：{err}"},
+            })
+        else:
+            cards = [self._sub_card(s) for s in subs[:30] if getattr(s, "name", None)]
+            if cards:
+                nodes.extend(cards)
+                if len(subs) > 30:
+                    nodes.append({
+                        "component": "VCardText",
+                        "props": {"class": "pa-0 px-1 text-caption text-medium-emphasis"},
+                        "text": f"共 {len(subs)} 个订阅，此处只显示前 30 个",
+                    })
+            else:
+                nodes.append({
+                    "component": "VCardText",
+                    "props": {"class": "pa-0 px-1 text-caption text-medium-emphasis"},
+                    "text": "暂无订阅",
+                })
+
+        nodes.append({
+            "component": "VCardText",
+            "props": {"class": "pa-0 px-1 pt-3 text-caption text-medium-emphasis"},
+            "text": f"上次运行：{self._last_run}",
+        })
+        recent = list(reversed(self._activities[-8:]))
+        nodes.append({
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "mt-2"},
+            "content": [
+                {
+                    "component": "VList",
+                    "props": {"density": "compact"},
+                    "content": [
+                        {"component": "VListItem", "props": {"title": line, "class": "text-caption"}}
+                        for line in (recent or ["暂无运行记录"])
+                    ],
+                }
+            ],
+        })
+        return nodes
+
+    def _trigger_card(self) -> dict:
+        return {
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "mb-3"},
+            "content": [
+                {
+                    "component": "VBtn",
+                    "props": {
+                        "color": "primary",
+                        "variant": "elevated",
+                        "block": True,
+                        "prepend-icon": "mdi-refresh",
+                        "text": "立即洗版一次",
+                    },
+                    "events": {
+                        "click": {
+                            "api": f"plugin/{self.__class__.__name__}/run",
+                            "method": "POST",
+                            "params": {},
+                        }
+                    },
+                }
+            ],
+        }
+
+    def _sub_card(self, sub: Any) -> dict:
+        """单个订阅卡片：左海报 + 右标题/当前版本/集数。"""
+        name = str(getattr(sub, "name", "") or "")
+        year = str(getattr(sub, "year", "") or "")
+        stype = str(getattr(sub, "type", "") or "")
+        cur = self._current_version_cached(sub)
+        bits = [b for b in (stype, year) if b]
+        total_ep = self._to_int(getattr(sub, "total_episode", 0), 0, 0, 10000)
+        if total_ep:
+            lack = self._to_int(getattr(sub, "lack_episode", 0), 0, 0, 10000)
+            bits.append(f"{max(0, total_ep - lack)}/{total_ep} 集")
+        info = " · ".join(bits) or "—"
+        cur_text = f"当前版本：{self._shorten(cur, 40)}" if cur else "当前版本：未记录"
+        return {
+            "component": "VCard",
+            "props": {"variant": "flat", "class": "mb-3 pa-2 d-flex align-center"},
+            "content": [
+                self._poster_node(str(getattr(sub, "poster", "") or ""), name),
+                {
+                    "component": "VCardText",
+                    "props": {"class": "py-0 px-3 flex-grow-1", "style": "min-width:0"},
+                    "content": [
+                        {
+                            "component": "VCardTitle",
+                            "props": {"class": "pa-0 text-body-1 font-weight-bold text-truncate"},
+                            "text": name,
+                        },
+                        {
+                            "component": "VCardSubtitle",
+                            "props": {"class": "pa-0 text-caption text-medium-emphasis text-truncate"},
+                            "text": cur_text,
+                        },
+                        {
+                            "component": "VCardText",
+                            "props": {"class": "pa-0 pt-1 text-caption text-medium-emphasis"},
+                            "text": info,
+                        },
+                    ],
                 },
-            },
-            {
-                "component": "VAlert",
+            ],
+        }
+
+    def _poster_node(self, poster: str, name: str) -> dict:
+        """海报，取不到就画一个带首字的占位块，避免破图。"""
+        w, h = 68, 98
+        url = self._poster_url(poster)
+        if url:
+            return {
+                "component": "VImg",
                 "props": {
-                    "type": "secondary",
-                    "variant": "tonal",
-                    "text": f"上次运行：{self._last_run}",
+                    "src": url,
+                    "width": w,
+                    "height": h,
+                    "cover": True,
+                    "class": "rounded flex-shrink-0",
+                    "style": "background:#eee",
                 },
+            }
+        return {
+            "component": "VSheet",
+            "props": {
+                "width": w,
+                "height": h,
+                "class": "rounded flex-shrink-0 bg-grey-lighten-3 d-flex align-center justify-center",
             },
-            {
-                "component": "VCard",
-                "props": {"title": "运行记录（最近 30 条）", "variant": "outlined"},
-                "content": [
-                    {
-                        "component": "VList",
-                        "props": {"density": "compact"},
-                        "content": [
-                            {
-                                "component": "VListItem",
-                                "props": {"title": line},
-                            }
-                            for line in (recent or ["暂无运行记录"])
-                        ],
-                    }
-                ],
-            },
-        ]
+            "content": [
+                {
+                    "component": "VCardText",
+                    "props": {"class": "pa-0 text-h6 text-medium-emphasis"},
+                    "text": (name[:1] or "?"),
+                }
+            ],
+        }
+
+    @staticmethod
+    def _poster_url(raw: str) -> str:
+        """把订阅海报字段转成浏览器能直接加载的地址。"""
+        u = (raw or "").strip()
+        if not u:
+            return ""
+        if u.startswith("//"):
+            return "https:" + u
+        low = u.lower()
+        if not low.startswith(("http://", "https://")):
+            # 本机静态资源（如 /static/poster/xxx.jpg）可直接用；其他未知格式不渲染，避免破图
+            return u if u.startswith("/") else ""
+        # 豆瓣图有防盗链，走后端图片代理
+        if "doubanio.com" in low:
+            return "api/v1/system/img/0?imgurl=" + quote(u, safe="")
+        return u
+
+    @staticmethod
+    def _shorten(text: str, limit: int) -> str:
+        t = (text or "").strip()
+        return t if len(t) <= limit else t[: limit - 1] + "…"
+
+    def _current_version_cached(self, sub: Any) -> str:
+        """当前版本标题，带 5 分钟缓存，避免每次打开详情页都批量查库。"""
+        try:
+            sid = int(getattr(sub, "id", 0) or 0)
+        except (TypeError, ValueError):
+            sid = 0
+        now = time.time()
+        hit = self._ver_cache.get(sid)
+        if hit and (now - hit[1]) < 300:
+            return hit[0]
+        val = self._current_version_title(sub)
+        if sid:
+            self._ver_cache[sid] = (val, now)
+        return val
 
     # ------------------------------------------------------------------ #
     # 对外 API：手动触发
@@ -826,6 +982,9 @@ class WashUpgrade(_PluginBase):
             return
 
         bonus = [k.strip() for k in self._bonus_keywords.split(",") if k.strip()]
+        is_tv = mtype is MediaType.TV
+        total_ep = self._to_int(getattr(sub, "total_episode", 0), 0, 0, 10000)
+        skipped_single = 0
         best_ctx: Any = None
         best_title = ""
         best_score = -1
@@ -834,12 +993,24 @@ class WashUpgrade(_PluginBase):
             t = getattr(ti, "title", None) if ti else getattr(ctx, "title", None)
             if not t or not self._passes_filters(t):
                 continue
+            # 电视剧画质洗版不应被单集资源触发；只在出现全集/整季时才洗（分集转全集）
+            if is_tv and self._full_season_only and not self._is_complete_pack(t, total_ep):
+                skipped_single += 1
+                continue
             s = self._score_title(t, self._dim_enabled, self._dim_values, bonus)
             if s > best_score:
                 best_score, best_ctx, best_title = s, ctx, t
 
+        if skipped_single:
+            self._record(
+                f"《{name}》跳过 {skipped_single} 个分集资源（设置：电视剧只在出现全集时洗版）"
+            )
+
         if best_ctx is None:
-            self._record(f"《{name}》未找到符合过滤条件的资源，跳过")
+            if is_tv and self._full_season_only and skipped_single:
+                self._record(f"《{name}》暂无全集资源，继续等分集攒齐后转全集洗版")
+            else:
+                self._record(f"《{name}》未找到符合过滤条件的资源，跳过")
             return
 
         # 1) 当前版本：优先取已下载记录里的种子名，其次用本插件上次下载记录
@@ -853,7 +1024,8 @@ class WashUpgrade(_PluginBase):
 
         # 2) 对比：是否发现更高版本
         if best_score > cur_score and (best_score - cur_score) >= self._score_threshold:
-            self._record(f"《{name}》对比后发现更高版本：{best_title}（评分 {best_score}）")
+            tag = "（全集）" if (is_tv and self._is_complete_pack(best_title, total_ep)) else ""
+            self._record(f"《{name}》对比后发现更高版本{tag}：{best_title}（评分 {best_score}）")
             # 3) 进行评分洗版
             if self._dry_run:
                 self._record(f"《{name}》[试运行] 将进行评分洗版（不实际下载）")
