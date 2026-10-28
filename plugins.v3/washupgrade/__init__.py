@@ -74,7 +74,7 @@ class WashUpgrade(_PluginBase):
     plugin_name = "洗版自用"
     plugin_desc = "评分洗版：原生最佳版本触发，或自选类别打分覆盖 MP 原生规则。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.4.2"
+    plugin_version = "1.4.3"
     plugin_author = "your-name"
     author_url = "https://github.com/your-name"
     plugin_config_prefix = "washupgrade_"
@@ -87,6 +87,7 @@ class WashUpgrade(_PluginBase):
     _only_best_version = True
     _crontab = "0 4 * * *"
     _dry_run = True
+    _run_once = False
     _wash_mode = _MODE_NATIVE
     # 每个维度：是否启用 + 勾选的类别（按内置优先级 #1→#9 自动排序）
     _dim_enabled: dict[str, bool] = {}
@@ -131,6 +132,18 @@ class WashUpgrade(_PluginBase):
         except (TypeError, ValueError):
             self._score_threshold = 0
         self._record("插件已加载 / 重新配置")
+        # 「立即运行一次」开关：保存配置时若为开，则触发一次并自动复位为关，避免重启重复执行
+        self._run_once = bool(config.get("run_once"))
+        if self._run_once:
+            self._run_once = False
+            try:
+                reset_cfg = dict(config)
+                reset_cfg["run_once"] = False
+                self.update_config(reset_cfg)
+            except Exception as e:  # noqa: BLE001
+                self._record(f"复位「立即运行一次」失败：{e}")
+            if self._enabled:
+                self._trigger_background("立即运行一次")
 
     def get_state(self) -> bool:
         return self._enabled
@@ -262,19 +275,8 @@ class WashUpgrade(_PluginBase):
                 },
             })
             dim_items.append({"component": "VDivider", "props": {"class": "my-3"}})
-        return [
-            {
-                "component": "VForm",
-                "content": [
-                    # ===== 分区一：基础设置 =====
-                    {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "info",
-                            "variant": "tonal",
-                            "text": "① 基础设置（通用开关与触发方式）",
-                        },
-                    },
+        content: list[dict] = [
+                    # ===== 分区一：基础设置（不再放标题提示条） =====
                     {"component": "VSwitch", "props": {"model": "enabled", "label": "启用评分洗版"}},
                     {
                         "component": "VSelect",
@@ -322,6 +324,13 @@ class WashUpgrade(_PluginBase):
                         },
                     },
                     {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "run_once",
+                            "label": "立即运行一次（保存后马上按当前配置执行一次，执行完自动关闭）",
+                        },
+                    },
+                    {
                         "component": "VAlert",
                         "props": {
                             "type": "info",
@@ -335,7 +344,7 @@ class WashUpgrade(_PluginBase):
                         "props": {
                             "type": "warning",
                             "variant": "tonal",
-                            "text": "② 自定义类别（仅在上方「洗版模式 = 自定义类别打分」时生效）"
+                            "text": "自定义类别（仅当上方「洗版模式 = 自定义类别打分」时生效）"
                                     "。像 MP「洗版评分规则」一样：每个维度用开关决定是否启用，"
                                     "点开下拉勾选需要的类别即可（可多选）。"
                                     "同一维度内，列表越靠前的类别越优先；不勾选的类别不会命中。",
@@ -381,15 +390,25 @@ class WashUpgrade(_PluginBase):
                             "placeholder": "0",
                         },
                     },
-                ],
-            }
-        ], {
+                ]
+        # 加大行与行的间距（Vuetify 间距类，MP 表单会把 props 透传给组件）
+        for _it in content:
+            _comp = _it.get("component")
+            _pr = _it.setdefault("props", {})
+            if _comp in ("VSelect", "VTextField"):
+                _pr.setdefault("class", "mb-5")
+            elif _comp == "VSwitch":
+                _pr.setdefault("class", "mb-4")
+            elif _comp == "VAlert":
+                _pr.setdefault("class", "mb-3")
+        return [{"component": "VForm", "content": content}], {
             "enabled": False,
             "wash_mode": _MODE_NATIVE,
             "scope": _SCOPE_ALL,
             "only_best_version": True,
             "crontab": "0 4 * * *",
             "dry_run": True,
+            "run_once": False,
             **{f"{dim}_enabled": True for dim, _v in _DIMENSIONS},
             **{f"{dim}_values": list(vals) for dim, vals in _DIMENSIONS},
             "min_resolution": "",
@@ -494,21 +513,29 @@ class WashUpgrade(_PluginBase):
     def get_command(self) -> list[dict[str, Any]]:
         return []
 
+    def _trigger_background(self, reason: str) -> bool:
+        """后台线程执行一次洗版，避免阻塞前端或配置保存。返回是否真正触发。"""
+        if self._running or not self.get_state():
+            return False
+        self._running = True
+
+        def _worker() -> None:
+            try:
+                self._record(f"手动触发：{reason}")
+                self.wash()
+            finally:
+                self._running = False
+
+        Thread(target=_worker, daemon=True).start()
+        return True
+
     def run_now(self) -> dict[str, Any]:
         """手动触发入口：后台线程执行，避免前端请求超时。"""
         if self._running:
             return {"success": False, "message": "上一次洗版仍在执行中，请稍后再试。"}
         if not self.get_state():
             return {"success": False, "message": "插件未启用，无法触发。"}
-        self._running = True
-
-        def _worker() -> None:
-            try:
-                self.wash()
-            finally:
-                self._running = False
-
-        Thread(target=_worker, daemon=True).start()
+        self._trigger_background("详情页按钮")
         return {"success": True, "message": "已触发洗版，详见「数据」页运行记录。"}
 
     # ------------------------------------------------------------------ #
