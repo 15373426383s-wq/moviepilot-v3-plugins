@@ -19,7 +19,7 @@ _SCOPE_TV = "tv"
 
 # 洗版模式
 _MODE_NATIVE = "native"   # 复用 MoviePilot 原生最佳版本搜索（全局评分规则 + 订阅目标）
-_MODE_CUSTOM = "custom"   # 自定义权重打分，覆盖 MP 原生规则
+_MODE_CUSTOM = "custom"   # 自定义类别打分，覆盖 MP 原生规则
 
 # 9 维评分维度（顺序 = 优先级 #1 → #9，与 MP「洗版评分规则」页一致）
 _DIMENSIONS = [
@@ -38,7 +38,6 @@ _DIMENSIONS = [
     ("file_extension", ["MKV", "MP4", "AVI", "MOV", "WMV", "FLV", "RMVB", "ISO", "M4V",
                        "MPG", "MPEG", "3GP", "TS", "WEBM", "RM"]),
 ]
-_DEFAULT_WEIGHTS = [100, 70, 50, 40, 30, 20, 12, 8, 5]
 _RES_RANK = {"8K": 6, "4K": 5, "1080P": 4, "1080I": 3, "720P": 2, "SD": 1}
 # 各维度的中文名 + 一句通俗说明（用于配置页，避免英文术语看不懂）
 _DIM_ZH = {
@@ -63,8 +62,8 @@ class WashUpgrade(_PluginBase):
     两种洗版模式：
     - 原生最佳版本（默认，推荐）：定时/手动对目标订阅触发 MoviePilot 原生的「最佳版本」搜索，
       评分规则、画质/特效目标、分集/全集处理全部由宿主完成（即「洗版评分规则」页 + 订阅「最佳版本」）。
-    - 自定义权重打分：插件自己按可配置的 9 维优先级权重对资源打分，搜索并下载更优版本，
-      覆盖 MP 原生规则，做精细控制。
+    - 自定义类别打分：插件按你在配置页勾选的类别（分辨率/来源/视频编码…）自行打分，
+      搜索并下载更优版本，覆盖 MP 原生规则，做精细控制。
 
     资源来源：MoviePilot 已配置的 PT 站点（由宿主搜索/下载链负责）。
 
@@ -73,9 +72,9 @@ class WashUpgrade(_PluginBase):
     """
 
     plugin_name = "洗版自用"
-    plugin_desc = "评分洗版：原生最佳版本触发，或自定义权重打分覆盖 MP 原生规则。"
+    plugin_desc = "评分洗版：原生最佳版本触发，或自选类别打分覆盖 MP 原生规则。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.4.1"
+    plugin_version = "1.4.2"
     plugin_author = "your-name"
     author_url = "https://github.com/your-name"
     plugin_config_prefix = "washupgrade_"
@@ -89,7 +88,9 @@ class WashUpgrade(_PluginBase):
     _crontab = "0 4 * * *"
     _dry_run = True
     _wash_mode = _MODE_NATIVE
-    _weights = list(_DEFAULT_WEIGHTS)
+    # 每个维度：是否启用 + 勾选的类别（按内置优先级 #1→#9 自动排序）
+    _dim_enabled: dict[str, bool] = {}
+    _dim_values: dict[str, list[str]] = {}
     _min_resolution = ""
     _exclude_keywords = ""
     _bonus_keywords = ""
@@ -114,14 +115,14 @@ class WashUpgrade(_PluginBase):
         self._crontab = str(config.get("crontab") or "0 4 * * *")
         self._dry_run = bool(config.get("dry_run", True))
         self._wash_mode = str(config.get("wash_mode") or _MODE_NATIVE)
-        # 9 维权重（仅自定义模式生效）
-        weights: list[int] = []
-        for i, (dim, _vals) in enumerate(_DIMENSIONS):
-            try:
-                weights.append(int(config.get(f"{dim}_weight", _DEFAULT_WEIGHTS[i])))
-            except (TypeError, ValueError):
-                weights.append(_DEFAULT_WEIGHTS[i])
-        self._weights = weights
+        # 9 维类别选择（仅自定义模式生效）：每个维度 启用开关 + 勾选类别
+        enabled: dict[str, bool] = {}
+        values: dict[str, list[str]] = {}
+        for dim, all_vals in _DIMENSIONS:
+            enabled[dim] = bool(config.get(f"{dim}_enabled", True))
+            values[dim] = self._normalize_values(config.get(f"{dim}_values", all_vals), all_vals)
+        self._dim_enabled = enabled
+        self._dim_values = values
         self._min_resolution = str(config.get("min_resolution") or "")
         self._exclude_keywords = str(config.get("exclude_keywords") or "")
         self._bonus_keywords = str(config.get("bonus_keywords") or "")
@@ -149,29 +150,63 @@ class WashUpgrade(_PluginBase):
     def _norm_title(title: str) -> str:
         return (title or "").upper()
 
+    @staticmethod
+    def _normalize_values(raw: Any, all_vals: list[str]) -> list[str]:
+        """把配置里的类别选择规整成「按内置优先级排序」的有效列表。
+
+        兼容前端可能存成数组或逗号字符串；非法值丢弃；空则回退为全部类别。
+        """
+        if isinstance(raw, str):
+            chosen = [s.strip() for s in raw.split(",") if s.strip()]
+        elif isinstance(raw, (list, tuple)):
+            chosen = [str(s).strip() for s in raw if str(s).strip()]
+        else:
+            chosen = []
+        picked = set(chosen)
+        ordered = [v for v in all_vals if v in picked]
+        return ordered or list(all_vals)
+
     @classmethod
-    def _score_title(cls, title: str, weights: list[int], bonus: list[str] | None = None) -> int:
-        """按 9 维权重对资源标题打分。命中维度内更靠前的（更优）取值得分更高。"""
+    def _score_title(
+        cls,
+        title: str,
+        dim_enabled: dict[str, bool] | None = None,
+        dim_values: dict[str, list[str]] | None = None,
+        bonus: list[str] | None = None,
+    ) -> int:
+        """按维度优先级给资源标题打分（无需用户填数字）。
+
+        - 维度越靠前（#1 分辨率 → #9 文件格式）权重越高，越靠前的维度命中加分越多；
+        - 同维度内，勾选列表里越靠前的类别得分越高；
+        - 未启用的维度不参与打分。
+        """
         if not title:
             return 0
+        dim_enabled = dim_enabled or {}
+        dim_values = dim_values or {}
         tu = cls._norm_title(title)
         ext = tu.rsplit(".", 1)[-1] if "." in tu else ""
         bonus = bonus or []
         total = 0
-        for (dim, vals), w in zip(_DIMENSIONS, weights):
-            matched_idx: int | None = None
-            for tok in sorted(vals, key=len, reverse=True):
+        n_dims = len(_DIMENSIONS)
+        for idx, (dim, all_vals) in enumerate(_DIMENSIONS):
+            if not dim_enabled.get(dim, True):
+                continue
+            chosen = dim_values.get(dim) or all_vals
+            dim_weight = n_dims - idx  # #1 最重，逐级递减
+            matched_rank: int | None = None
+            for tok in sorted(chosen, key=len, reverse=True):
                 tgt = _SYN.get(tok, tok)
                 if dim == "file_extension":
                     if ext == tgt:
-                        matched_idx = vals.index(tok)
+                        matched_rank = chosen.index(tok)
                         break
                 else:
                     if tgt in tu or tgt.replace("&", ".") in tu or tgt.replace(".", "&") in tu:
-                        matched_idx = vals.index(tok)
+                        matched_rank = chosen.index(tok)
                         break
-            if matched_idx is not None:
-                total += w * (len(vals) - 1 - matched_idx)
+            if matched_rank is not None:
+                total += dim_weight * (len(chosen) - matched_rank)
         # 优先词加分
         for b in bonus:
             if b and cls._norm_title(b) in tu:
@@ -200,20 +235,33 @@ class WashUpgrade(_PluginBase):
     # 配置页 + 默认配置
     # ------------------------------------------------------------------ #
     def get_form(self) -> tuple[list[dict], dict[str, Any]]:
-        weight_items = []
-        for i, (dim, _vals) in enumerate(_DIMENSIONS):
-            zh, desc = _DIM_ZH.get(dim, (dim, ""))
-            weight_items.append({
-                "component": "VTextField",
+        # 每个维度一组：开关（#n 中文名）+ 类别多选框（参照 MP「洗版评分规则」页的交互）
+        dim_items: list[dict] = []
+        for i, (dim, all_vals) in enumerate(_DIMENSIONS):
+            zh, _desc = _DIM_ZH.get(dim, (dim, ""))
+            dim_items.append({
+                "component": "VSwitch",
                 "props": {
-                    "model": f"{dim}_weight",
-                    "label": f"{zh}（重要度，默认 {_DEFAULT_WEIGHTS[i]}）",
-                    "type": "number",
-                    "placeholder": str(_DEFAULT_WEIGHTS[i]),
-                    "hint": desc,
-                    "persistent-hint": True,
+                    "model": f"{dim}_enabled",
+                    "label": f"#{i + 1} {zh}（{dim}）",
+                    "color": "primary",
+                    "hide-details": True,
                 },
             })
+            dim_items.append({
+                "component": "VSelect",
+                "props": {
+                    "model": f"{dim}_values",
+                    "label": f"点开选择需要的「{zh}」类别（可多选，越靠前越优先）",
+                    "items": [{"title": v, "value": v} for v in all_vals],
+                    "multiple": True,
+                    "chips": True,
+                    "closable-chips": True,
+                    "variant": "outlined",
+                    "hide-details": True,
+                },
+            })
+            dim_items.append({"component": "VDivider", "props": {"class": "my-3"}})
         return [
             {
                 "component": "VForm",
@@ -235,7 +283,7 @@ class WashUpgrade(_PluginBase):
                             "label": "洗版模式",
                             "items": [
                                 {"title": "原生最佳版本（推荐，复用 MP 评分规则）", "value": _MODE_NATIVE},
-                                {"title": "自定义权重打分（覆盖 MP 原生规则）", "value": _MODE_CUSTOM},
+                                {"title": "自定义类别打分（自己勾选类别，覆盖 MP 原生规则）", "value": _MODE_CUSTOM},
                             ],
                         },
                     },
@@ -281,23 +329,19 @@ class WashUpgrade(_PluginBase):
                             "text": "「原生最佳版本」模式：评分规则与画质/特效目标请在 MoviePilot「洗版评分规则」页和订阅的「最佳版本」里设置，本插件只负责按时触发它们。",
                         },
                     },
-                    # ===== 分区二：自定义权重打分 =====
+                    # ===== 分区二：自定义类别选择 =====
                     {
                         "component": "VAlert",
                         "props": {
                             "type": "warning",
                             "variant": "tonal",
-                            "text": "② 自定义权重打分（仅在上方「洗版模式 = 自定义权重打分」时生效）"
-                                    "。「重要度」= 挑选更好版本时该项所占比重，数字越大越优先。"
-                                    "例如分辨率 100、文件格式 5，代表更看重清晰度、不太在意格式。"
-                                    "一般保持默认即可，无需修改。",
+                            "text": "② 自定义类别（仅在上方「洗版模式 = 自定义类别打分」时生效）"
+                                    "。像 MP「洗版评分规则」一样：每个维度用开关决定是否启用，"
+                                    "点开下拉勾选需要的类别即可（可多选）。"
+                                    "同一维度内，列表越靠前的类别越优先；不勾选的类别不会命中。",
                         },
                     },
-                    *weight_items,
-                    {
-                        "component": "VDivider",
-                        "props": {"class": "my-3"},
-                    },
+                    *dim_items,
                     {
                         "component": "VSelect",
                         "props": {
@@ -346,7 +390,8 @@ class WashUpgrade(_PluginBase):
             "only_best_version": True,
             "crontab": "0 4 * * *",
             "dry_run": True,
-            **{f"{dim}_weight": _DEFAULT_WEIGHTS[i] for i, (dim, _vals) in enumerate(_DIMENSIONS)},
+            **{f"{dim}_enabled": True for dim, _v in _DIMENSIONS},
+            **{f"{dim}_values": list(vals) for dim, vals in _DIMENSIONS},
             "min_resolution": "",
             "exclude_keywords": "",
             "bonus_keywords": "",
@@ -357,7 +402,7 @@ class WashUpgrade(_PluginBase):
     # 详情页（数据 + 手动触发）
     # ------------------------------------------------------------------ #
     def get_page(self) -> list[dict]:
-        mode_text = "原生最佳版本" if self._wash_mode == _MODE_NATIVE else "自定义权重打分"
+        mode_text = "原生最佳版本" if self._wash_mode == _MODE_NATIVE else "自定义类别打分"
         scope_text = {"all": "全部", "movie": "仅电影", "tv": "仅电视剧"}.get(self._scope, "全部")
         recent = list(reversed(self._activities[-30:]))
         return [
@@ -500,7 +545,7 @@ class WashUpgrade(_PluginBase):
     def wash(self) -> None:
         if not self.get_state():
             return
-        mode_text = "原生最佳版本" if self._wash_mode == _MODE_NATIVE else "自定义权重打分"
+        mode_text = "原生最佳版本" if self._wash_mode == _MODE_NATIVE else "自定义类别打分"
         scope_text = {"all": "全部", "movie": "电影", "tv": "电视剧"}.get(self._scope, "全部")
         self._record(f"开始扫描（模式：{mode_text}，范围：{scope_text}，试运行：{self._dry_run}）")
         try:
@@ -586,7 +631,12 @@ class WashUpgrade(_PluginBase):
                 continue
             if not self._passes_filters(t):
                 continue
-            s = self._score_title(t, self._weights, [k.strip() for k in self._bonus_keywords.split(",") if k.strip()])
+            s = self._score_title(
+                t,
+                self._dim_enabled,
+                self._dim_values,
+                [k.strip() for k in self._bonus_keywords.split(",") if k.strip()],
+            )
             if s > best_score:
                 best_score, best_ctx = s, ctx
 
