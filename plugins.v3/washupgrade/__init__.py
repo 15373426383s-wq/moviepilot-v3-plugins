@@ -107,9 +107,9 @@ class WashUpgrade(_PluginBase):
     """
 
     plugin_name = "洗版自用"
-    plugin_desc = "评分洗版：原生触发或自选类别打分；电视剧分集也洗、出全集自动转全集；洗到目标即停并从首页移除。"
+    plugin_desc = "评分洗版：分集也洗、出全集自动转全集（但不降画质）；9 个维度可分别设「洗到哪一档就停」。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.5.0"
+    plugin_version = "1.5.1"
     plugin_author = "your-name"
     author_url = "https://github.com/your-name"
     plugin_config_prefix = "washupgrade_"
@@ -138,8 +138,9 @@ class WashUpgrade(_PluginBase):
     _tv_mode = _TV_AUTO         # 电视剧：分集也洗，出全集后自动转全集
     # 洗版封顶：达到这些条件后该订阅不再检测、不再洗版
     _max_wash_times = 2         # 同一订阅最多洗几次（0 = 不限）
-    _target_resolution = "4K"   # 洗到这个分辨率即封顶（"" = 不按分辨率封顶）
-    _target_source = ""         # 洗到这个来源即封顶（"" = 不按来源封顶）
+    # 各维度的「封顶档位」：当前版本达到该档位即不再洗；"" = 该维度不设封顶
+    # 例如 {"resolution": "4K", "source": "WEB-DL", ...} 表示洗到 4K 且 WEB-DL 以上就停
+    _ceilings: dict[str, str] = {}
     _stop_on_complete_pack = True   # 电视剧洗到全集即视为完成
     _give_up_rounds = 3         # 连续这么多轮没找到更优版本就收工（0 = 不放弃）
     _hide_done = True           # 已完成的订阅从详情页移除
@@ -198,11 +199,23 @@ class WashUpgrade(_PluginBase):
             self._tv_mode = _TV_AUTO
         # 洗版封顶（到达后不再检测、不再洗版）
         self._max_wash_times = self._to_int(config.get("max_wash_times"), 2, 0, 100)
-        # 注意：区分「键不存在」（用默认 4K）与「显式选了不封顶」（空串）
-        raw_target_res = config.get("target_resolution", "4K")
-        self._target_resolution = str(raw_target_res if raw_target_res is not None else "").strip().upper()
-        raw_target_src = config.get("target_source", "")
-        self._target_source = str(raw_target_src if raw_target_src is not None else "").strip().upper()
+        # 各维度封顶档位：9 个维度都能单独设「洗到哪一档就停」，空串 = 该维度不封顶
+        ceilings: dict[str, str] = {}
+        for dim, all_vals in _DIMENSIONS:
+            key = f"ceiling_{dim}"
+            if key in config:
+                raw = config.get(key)
+            elif dim == "resolution" and "target_resolution" in config:
+                raw = config.get("target_resolution")   # 兼容 1.5.0 的旧配置
+            elif dim == "source" and "target_source" in config:
+                raw = config.get("target_source")
+            elif dim == "resolution":
+                raw = "4K"                              # 默认只对分辨率设 4K 封顶
+            else:
+                raw = ""
+            val = str(raw or "").strip().upper()
+            ceilings[dim] = val if val in all_vals else ""
+        self._ceilings = ceilings
         self._stop_on_complete_pack = bool(config.get("stop_on_complete_pack", True))
         self._give_up_rounds = self._to_int(config.get("give_up_rounds"), 3, 0, 100)
         self._hide_done = bool(config.get("hide_done", True))
@@ -314,24 +327,46 @@ class WashUpgrade(_PluginBase):
         return -1
 
     def _reached_target(self, title: str) -> bool:
-        """当前版本是否已经洗到目标档位（分辨率/来源）。用于「到顶就不再洗」。"""
+        """当前版本是否已达到你设的所有「封顶档位」（分辨率/来源/画质特效… 逐维判断）。
+
+        任意一维没达到就返回 False（继续洗）；没设封顶的维度不参与判断。
+        """
         if not title:
             return False
-        res_all = dict(_DIMENSIONS)["resolution"]
-        if self._target_resolution:
-            if self._target_resolution in res_all:
-                need = res_all.index(self._target_resolution)
-                got = self._dim_index("resolution", title)
-                if got < 0 or got > need:
-                    return False
-            # 目标值不在候选表里就忽略这一项，避免配置写错导致永不封顶
-        if self._target_source:
-            src_all = dict(_DIMENSIONS)["source"]
-            if self._target_source in src_all:
-                need = src_all.index(self._target_source)
-                got = self._dim_index("source", title)
-                if got < 0 or got > need:
-                    return False
+        for dim, all_vals in _DIMENSIONS:
+            need_val = (self._ceilings or {}).get(dim) or ""
+            if not need_val or need_val not in all_vals:
+                continue
+            need = all_vals.index(need_val)
+            got = self._dim_index(dim, title)
+            if got < 0 or got > need:   # 未命中视为没到这一档
+                return False
+        return True
+
+    def _ceiling_text(self) -> str:
+        """把封顶档位拼成一句人话，用于日志/状态行。"""
+        bits = []
+        for dim, all_vals in _DIMENSIONS:
+            v = (self._ceilings or {}).get(dim) or ""
+            if v:
+                zh = _DIM_ZH.get(dim, (dim, ""))[0]
+                bits.append(f"{zh} {v}")
+        return " + ".join(bits) if bits else "不限"
+
+    @classmethod
+    def _not_worse(cls, new_title: str, old_title: str) -> bool:
+        """新资源的关键画质是否不低于旧资源（防止 1080P 全集把 4K 分集洗差）。
+
+        按 分辨率 → 来源 → 视频编码 → 画质特效 → 色深 的顺序逐维比较，
+        第一个双方都识别到的维度决定结果；都没识别到时按「不差」处理。
+        """
+        for dim in ("resolution", "source", "video_codec", "hdr", "color_depth"):
+            a = cls._dim_index(dim, new_title)
+            b = cls._dim_index(dim, old_title)
+            if a < 0 or b < 0:      # 有一边没标这个维度，跳过，不让它误导判断
+                continue
+            if a != b:
+                return a < b        # 下标越小画质越好
         return True
 
     def _load_done(self) -> None:
@@ -377,11 +412,14 @@ class WashUpgrade(_PluginBase):
         if self._max_wash_times > 0 and times >= self._max_wash_times:
             return f"已洗版 {times} 次，达到次数上限"
         if self._stop_on_complete_pack and st.get("pack"):
-            return "已洗到全集/整季包"
+            t = str(st.get("title", "") or "")
+            # 全集没到封顶档位（例如只拿到 1080P 全集）不算完成，继续等更好的全集
+            if not t or self._reached_target(t):
+                return "已洗到全集/整季包"
         # 「已达目标画质」只在插件确实洗过之后才算数，否则重置/手动达标会立刻又被判完成
         if (times > 0 and cur_title and self._may_finish_early(sub, st)
                 and self._reached_target(cur_title)):
-            return f"当前版本已达目标画质（{self._target_resolution or '—'}）"
+            return f"当前版本已达封顶档位（{self._ceiling_text()}）"
         return ""
 
     def _mark_wash(self, sub: Any, cur_title: str, is_pack: bool = False) -> str:
@@ -396,13 +434,14 @@ class WashUpgrade(_PluginBase):
         st["at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         st["title"] = cur_title
         reason = ""
-        if self._stop_on_complete_pack and st.get("pack"):
+        if self._stop_on_complete_pack and st.get("pack") and self._reached_target(cur_title):
+            # 只有「已到封顶档位的全集」才算收工；1080P 全集不算，继续等更好的
             reason = "已洗到全集/整季包"
         elif self._max_wash_times > 0 and st["count"] >= self._max_wash_times:
             reason = f"已洗版 {st['count']} 次，达到次数上限"
         elif (cur_title and self._may_finish_early(sub, st)
                 and self._reached_target(cur_title)):
-            reason = f"已洗到目标画质（{self._target_resolution or '—'}）"
+            reason = f"已洗到封顶档位（{self._ceiling_text()}）"
         st["reason"] = reason
         self._done[key] = st
         self._save_done()
@@ -429,12 +468,15 @@ class WashUpgrade(_PluginBase):
         self._done[key] = st
         self._save_done()
 
-    def _count_miss(self, sub: Any, cur_title: str = "") -> str:
+    def _count_miss(self, sub: Any, cur_title: str = "", assume_pack: bool = False) -> str:
         """累计「本轮没找到更优版本」的次数，连续太多次就判定洗版结束。"""
         if self._give_up_rounds <= 0:
             return ""
         # 电视剧还在等全集时不能放弃，否则永远等不到「自动转全集」
-        if not self._may_finish_early(sub, self._done.get(self._done_key(sub))):
+        eff = self._done.get(self._done_key(sub)) or {}
+        if assume_pack and not eff.get("pack"):
+            eff = {**eff, "pack": True}   # 当前已是全集，不再需要「等全集」
+        if not self._may_finish_early(sub, eff):
             return ""
         key = self._done_key(sub)
         st = self._done.get(key)
@@ -553,6 +595,23 @@ class WashUpgrade(_PluginBase):
                 },
             })
             dim_items.append({"component": "VDivider", "props": {"class": "my-3"}})
+        # 封顶档位：9 个维度各一个下拉，「不限」= 该维度不参与封顶判断
+        ceiling_items: list[dict] = []
+        for i, (dim, all_vals) in enumerate(_DIMENSIONS):
+            zh, _desc = _DIM_ZH.get(dim, (dim, ""))
+            ceiling_items.append({
+                "component": "VSelect",
+                "props": {
+                    "model": f"ceiling_{dim}",
+                    "label": f"封顶 · #{i + 1} {zh}（达到这一档就停止洗版）",
+                    "items": (
+                        [{"title": f"不限（不按{zh}封顶）", "value": ""}]
+                        + [{"title": v, "value": v} for v in all_vals]
+                    ),
+                    "clearable": True,
+                    "variant": "outlined",
+                },
+            })
         content: list[dict] = [
                     # ===== 分区一：基础设置（不再放标题提示条） =====
                     {"component": "VSwitch", "props": {"model": "enabled", "label": "启用评分洗版"}},
@@ -678,39 +737,24 @@ class WashUpgrade(_PluginBase):
                         },
                     },
                     {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "text": "封顶档位（可多选几维，全部达到才算到顶）：比如分辨率设 4K、"
+                                    "来源设 WEB-DL，就是「洗到 4K 且 WEB-DL 以上」才停。"
+                                    "设「不限」的维度不参与判断。注意：全集也要过这一关——"
+                                    "站点只发 1080P 全集时不会把 4K 分集洗差，会继续等更好的全集。",
+                        },
+                    },
+                    *ceiling_items,
+                    {
                         "component": "VTextField",
                         "props": {
                             "model": "max_wash_times",
                             "label": "同一订阅最多洗几次（默认 2：一次分集/电影 + 一次全集；0 = 不限）",
                             "type": "number",
                             "placeholder": "2",
-                        },
-                    },
-                    {
-                        "component": "VSelect",
-                        "props": {
-                            "model": "target_resolution",
-                            "label": "洗到这个分辨率就算到顶（不再洗）",
-                            "items": [
-                                {"title": "8K", "value": "8K"},
-                                {"title": "4K（推荐）", "value": "4K"},
-                                {"title": "1080P", "value": "1080P"},
-                                {"title": "720P", "value": "720P"},
-                                {"title": "不按分辨率封顶", "value": ""},
-                            ],
-                        },
-                    },
-                    {
-                        "component": "VSelect",
-                        "props": {
-                            "model": "target_source",
-                            "label": "洗到这个来源就算到顶（可选，一般不用设）",
-                            "items": [
-                                {"title": "不按来源封顶（默认）", "value": ""},
-                                {"title": "REMUX / 原盘级", "value": "REMUX"},
-                                {"title": "BLURAY（蓝光）", "value": "BLURAY"},
-                                {"title": "WEB-DL（网页）", "value": "WEB-DL"},
-                            ],
                         },
                     },
                     {
@@ -812,8 +856,7 @@ class WashUpgrade(_PluginBase):
             "batch_limit": 10,
             "cooldown_hours": 12,
             "max_wash_times": 2,
-            "target_resolution": "4K",
-            "target_source": "",
+            **{f"ceiling_{dim}": ("4K" if dim == "resolution" else "") for dim, _v in _DIMENSIONS},
             "stop_on_complete_pack": True,
             "give_up_rounds": 3,
             "hide_done": True,
@@ -839,7 +882,7 @@ class WashUpgrade(_PluginBase):
                 f"{'运行中' if self._enabled else '已停用'} · {mode_text} · "
                 f"{'试运行' if self._dry_run else '正式'} · 间隔 {self._interval_seconds}s · "
                 f"每轮 {self._batch_limit or '不限'} · 冷却 {self._cooldown_hours}h · "
-                f"洗到 {self._target_resolution or '不限'} 停 · 最多洗 {self._max_wash_times or '不限'} 次"
+                f"洗到 {self._ceiling_text()} 停 · 最多洗 {self._max_wash_times or '不限'} 次"
             ),
         })
 
@@ -1301,9 +1344,9 @@ class WashUpgrade(_PluginBase):
         name = str(getattr(sub, "name", "") or "")
         cur = self._current_version_cached(sub)
         if cur and self._reached_target(cur):
-            self._set_done(sub, f"当前版本已达目标画质（{self._target_resolution or '—'}）", cur)
+            self._set_done(sub, f"当前版本已达封顶档位（{self._ceiling_text()}）", cur)
             self._record(
-                f"《{name}》已达目标画质（{self._target_resolution or '—'}），跳过触发，"
+                f"《{name}》已达封顶档位（{self._ceiling_text()}），跳过触发，"
                 f"后续不再检测，已从首页移除"
             )
             return
@@ -1403,7 +1446,7 @@ class WashUpgrade(_PluginBase):
             if packs:
                 pool = packs
                 if not cur_is_pack:
-                    self._record(f"《{name}》发现 {len(packs)} 个全集/整季资源 → 自动转全集洗版")
+                    self._record(f"《{name}》发现 {len(packs)} 个全集/整季资源，将优先按全集洗版")
             else:
                 if cur_is_pack:
                     self._record(f"《{name}》当前已是全集版本，站点暂无更优全集，本次不洗")
@@ -1427,7 +1470,7 @@ class WashUpgrade(_PluginBase):
         if best_ctx is None:
             # 没找到任何可用资源：累计空转轮次，连续太多次就收工，别一直扫
             self._record(f"《{name}》未找到符合过滤条件的资源，跳过")
-            miss_reason = self._count_miss(sub, cur_title)
+            miss_reason = self._count_miss(sub, cur_title, assume_pack=cur_is_pack)
             if miss_reason:
                 self._record(f"《{name}》洗版结束 → {miss_reason}，后续不再检测")
             return
@@ -1437,10 +1480,23 @@ class WashUpgrade(_PluginBase):
         # 已是全集时不再用分集覆盖（防止把全集洗成单集）
         if cur_is_pack and not best_is_pack:
             self._record(f"《{name}》当前已是全集版本，不接受分集覆盖，本次不洗")
+            miss_reason = self._count_miss(sub, cur_title, assume_pack=True)
+            if miss_reason:
+                self._record(f"《{name}》洗版结束 → {miss_reason}，后续不再检测")
             return
 
         if best_is_pack and not cur_is_pack:
-            # 分集 → 全集：这是「转全集洗版」，必须执行，不比较分数
+            # 分集 → 全集：这是「转全集洗版」，不比分（全集与单集标题几乎同分），
+            # 但必须过画质关——站点只有 1080P 全集时不能把 4K 分集洗差。
+            if cur_title and not self._not_worse(best_title, cur_title):
+                self._record(
+                    f"《{name}》发现全集资源但画质低于当前版本：{best_title}（评分 {best_score}）"
+                    f"低于 {cur_title}（评分 {cur_score}）→ 不转全集，继续等更好的全集"
+                )
+                miss_reason = self._count_miss(sub, cur_title, assume_pack=True)
+                if miss_reason:
+                    self._record(f"《{name}》洗版结束 → {miss_reason}，后续不再检测")
+                return
             self._record(
                 f"《{name}》出现全集资源：{best_title}（评分 {best_score}）→ 自动转全集洗版"
             )
@@ -1460,14 +1516,14 @@ class WashUpgrade(_PluginBase):
             if (cur_title and self._reached_target(cur_title)
                     and self._may_finish_early(sub, self._done.get(self._done_key(sub)))):
                 self._set_done(
-                    sub, f"当前版本已达目标画质（{self._target_resolution or '—'}）", cur_title
+                    sub, f"当前版本已达封顶档位（{self._ceiling_text()}）", cur_title
                 )
                 self._record(
-                    f"《{name}》洗版结束 → 已达目标画质（{self._target_resolution or '—'}），"
+                    f"《{name}》洗版结束 → 已达封顶档位（{self._ceiling_text()}），"
                     f"后续不再检测，已从首页移除"
                 )
                 return
-            miss_reason = self._count_miss(sub, cur_title)
+            miss_reason = self._count_miss(sub, cur_title, assume_pack=cur_is_pack)
             if miss_reason:
                 self._record(f"《{name}》洗版结束 → {miss_reason}，后续不再检测")
             return
