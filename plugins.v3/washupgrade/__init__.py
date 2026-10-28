@@ -1,3 +1,5 @@
+import random
+import time
 from datetime import datetime
 from threading import Thread
 from typing import Any
@@ -74,7 +76,7 @@ class WashUpgrade(_PluginBase):
     plugin_name = "洗版自用"
     plugin_desc = "评分洗版：原生最佳版本触发，或自选类别打分覆盖 MP 原生规则。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.4.4"
+    plugin_version = "1.4.5"
     plugin_author = "your-name"
     author_url = "https://github.com/your-name"
     plugin_config_prefix = "washupgrade_"
@@ -96,6 +98,12 @@ class WashUpgrade(_PluginBase):
     _exclude_keywords = ""
     _bonus_keywords = ""
     _score_threshold = 0
+    # 请求频率控制（防止站点因访问过于密集而封禁）
+    _interval_seconds = 60      # 每处理完一个订阅后等待的秒数（含随机抖动）
+    _batch_limit = 10           # 每轮最多处理多少个订阅（0 = 不限），其余下轮轮转
+    _cooldown_hours = 12        # 同一订阅的冷却小时数，冷却内跳过（0 = 不限）
+    _cursor = 0                 # 分批轮转起点
+    _last_wash_at: dict[int, float] = {}   # 订阅 id -> 上次洗版时间戳
     _last_run = "尚未运行"
 
     # 内存活动缓存（在「数据」页展示）
@@ -132,6 +140,15 @@ class WashUpgrade(_PluginBase):
             self._score_threshold = int(config.get("score_threshold") or 0)
         except (TypeError, ValueError):
             self._score_threshold = 0
+        # 请求频率控制
+        self._interval_seconds = self._to_int(config.get("interval_seconds"), 60, 0, 3600)
+        self._batch_limit = self._to_int(config.get("batch_limit"), 10, 0, 500)
+        self._cooldown_hours = self._to_int(config.get("cooldown_hours"), 12, 0, 720)
+        # 冷却记录/轮转游标：跨配置重载保留，但每个实例独立一份
+        if "_last_wash_at" not in self.__dict__:
+            self._last_wash_at = {}
+        if "_cursor" not in self.__dict__:
+            self._cursor = 0
         self._record("插件已加载 / 重新配置")
         # 「立即运行一次」开关：保存配置时若为开，则触发一次并自动复位为关，避免重启重复执行
         self._run_once = bool(config.get("run_once"))
@@ -163,6 +180,15 @@ class WashUpgrade(_PluginBase):
     @staticmethod
     def _norm_title(title: str) -> str:
         return (title or "").upper()
+
+    @staticmethod
+    def _to_int(raw: Any, default: int, low: int = 0, high: int = 10 ** 6) -> int:
+        """把配置里的数字安全转成 int，并夹到 [low, high] 区间。"""
+        try:
+            v = int(float(str(raw).strip()))
+        except (TypeError, ValueError):
+            return default
+        return max(low, min(high, v))
 
     @staticmethod
     def _normalize_values(raw: Any, all_vals: list[str]) -> list[str]:
@@ -339,6 +365,44 @@ class WashUpgrade(_PluginBase):
                             "text": "「原生最佳版本」模式：评分规则与画质/特效目标请在 MoviePilot「洗版评分规则」页和订阅的「最佳版本」里设置，本插件只负责按时触发它们。",
                         },
                     },
+                    # ===== 分区：请求频率（防止站点封禁） =====
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "error",
+                            "variant": "tonal",
+                            "text": "请求频率（防止站点封禁）：一次洗版会对每个订阅遍历所有 PT 站点，"
+                                    "短时间打太多请求容易被判定为爬虫而临时封禁。"
+                                    "下面三项在每次运行内部生效，建议先用默认值。",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "interval_seconds",
+                            "label": "每个订阅之间的间隔（秒）",
+                            "type": "number",
+                            "placeholder": "60",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "batch_limit",
+                            "label": "每轮最多处理订阅数（分批轮转，0 = 不限）",
+                            "type": "number",
+                            "placeholder": "10",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "cooldown_hours",
+                            "label": "同一订阅冷却（小时，冷却内跳过；0 = 不限）",
+                            "type": "number",
+                            "placeholder": "12",
+                        },
+                    },
                     # ===== 分区二：自定义类别选择 =====
                     {
                         "component": "VAlert",
@@ -410,6 +474,9 @@ class WashUpgrade(_PluginBase):
             "crontab": "0 4 * * *",
             "dry_run": True,
             "run_once": False,
+            "interval_seconds": 60,
+            "batch_limit": 10,
+            "cooldown_hours": 12,
             **{f"{dim}_enabled": True for dim, _v in _DIMENSIONS},
             **{f"{dim}_values": list(vals) for dim, vals in _DIMENSIONS},
             "min_resolution": "",
@@ -466,7 +533,10 @@ class WashUpgrade(_PluginBase):
                         f"模式：{mode_text} | "
                         f"范围：{scope_text} | "
                         f"仅最佳版本：{'是' if self._only_best_version else '否'} | "
-                        f"试运行：{'是' if self._dry_run else '否'}"
+                        f"试运行：{'是' if self._dry_run else '否'} | "
+                        f"间隔：{self._interval_seconds}s | "
+                        f"每轮上限：{self._batch_limit or '不限'} | "
+                        f"冷却：{self._cooldown_hours}h"
                     ),
                 },
             },
@@ -602,33 +672,114 @@ class WashUpgrade(_PluginBase):
             if self._scope == _SCOPE_TV and mtype is not MediaType.TV:
                 continue
             targets.append((sid, sub))
-            if self._dry_run:
-                self._record(f"[试运行] 将对《{name}》执行{mode_text}洗版")
 
         if not targets:
             self._last_run = "本次无可洗版订阅"
             self._record(self._last_run)
             return
 
-        if self._dry_run:
-            self._last_run = f"[试运行] 计划处理 {len(targets)} 个订阅"
+        # 1) 冷却：最近洗过的先跳过，避免反复打同一批站点
+        targets = self._apply_cooldown(targets)
+        # 2) 分批：每轮只处理 N 个，从上次结束处继续（轮转，不总是洗前几个）
+        targets = self._apply_batch(targets)
+
+        if not targets:
+            self._last_run = "本轮全部订阅都在冷却期内，跳过（未访问任何站点）"
             self._record(self._last_run)
             return
 
-        if self._wash_mode == _MODE_NATIVE:
-            try:
-                SubscribeChain().search(sids=tuple(sid for sid, _ in targets), manual=True)
-                self._last_run = f"已触发 {len(targets)} 个订阅的原生最佳版本搜索"
-                self._record(self._last_run)
-            except Exception as e:  # noqa: BLE001
-                self._last_run = f"触发失败：{e}"
-                self._record(self._last_run)
-        else:
-            bonus = [k.strip() for k in self._bonus_keywords.split(",") if k.strip()]
-            for sid, sub in targets:
-                self._custom_wash_one(sid, sub)
-            self._last_run = f"自定义洗版完成，处理 {len(targets)} 个订阅"
+        if self._dry_run:
+            self._last_run = f"[试运行] 计划处理 {len(targets)} 个订阅（未访问任何站点）"
             self._record(self._last_run)
+            for _sid, sub in targets:
+                self._record(f"[试运行] 将对《{str(getattr(sub, 'name', '') or '')}》执行{mode_text}洗版")
+            return
+
+        total = len(targets)
+        gap = self._interval_seconds
+        if gap > 0:
+            self._record(
+                f"请求节奏：每处理 1 个订阅后等待约 {gap} 秒（含随机抖动），"
+                f"本轮 {total} 个，预计 {max(1, round(gap * (total - 1) / 60))} 分钟内完成"
+            )
+
+        for i, (sid, sub) in enumerate(targets):
+            if self._wash_mode == _MODE_NATIVE:
+                self._native_wash_one(sid, sub)
+            else:
+                self._custom_wash_one(sid, sub)
+            self._last_wash_at[sid] = time.time()
+            if i < total - 1:
+                self._pace(i + 1, total)
+
+        self._last_run = f"{mode_text}洗版完成，处理 {total} 个订阅"
+        self._record(self._last_run)
+
+    # ------------------------------------------------------------------ #
+    # 请求频率控制
+    # ------------------------------------------------------------------ #
+    def _apply_cooldown(self, targets: list[tuple[int, Any]]) -> list[tuple[int, Any]]:
+        """冷却期内的订阅直接跳过，不产生任何站点请求。"""
+        if self._cooldown_hours <= 0:
+            return targets
+        limit = self._cooldown_hours * 3600
+        now = time.time()
+        kept: list[tuple[int, Any]] = []
+        skipped = 0
+        for sid, sub in targets:
+            last = self._last_wash_at.get(sid)
+            if last and (now - last) < limit:
+                skipped += 1
+                left_min = int((limit - (now - last)) / 60)
+                self._record(
+                    f"跳过《{str(getattr(sub, 'name', '') or '')}》："
+                    f"距上次洗版不足 {self._cooldown_hours} 小时（约 {left_min} 分钟后再试）"
+                )
+                continue
+            kept.append((sid, sub))
+        if skipped:
+            self._record(f"冷却过滤：跳过 {skipped} 个，剩余 {len(kept)} 个")
+        return kept
+
+    def _apply_batch(self, targets: list[tuple[int, Any]]) -> list[tuple[int, Any]]:
+        """每轮最多处理 N 个订阅，按轮转游标取，保证长期都能轮到。"""
+        limit = self._batch_limit
+        if limit <= 0 or len(targets) <= limit:
+            return targets
+        start = self._cursor % len(targets)
+        rotated = targets[start:] + targets[:start]
+        picked = rotated[:limit]
+        self._cursor = (start + limit) % len(targets)
+        self._record(
+            f"分批限流：共 {len(targets)} 个订阅，本轮只处理 {limit} 个（下次从第 {self._cursor + 1} 个继续）"
+        )
+        return picked
+
+    def _pace(self, done: int, total: int) -> None:
+        """两个订阅之间的等待，带 0~25% 随机抖动，避免固定周期特征。"""
+        base = self._interval_seconds
+        if base <= 0:
+            return
+        wait = base * (1 + random.uniform(0, 0.25))
+        self._record(f"等待 {wait:.0f} 秒后继续（进度 {done}/{total}，降低站点请求频率）")
+        self._sleep(wait)
+
+    @staticmethod
+    def _sleep(seconds: float) -> None:
+        """集中在一处的等待实现，便于测试替换。"""
+        try:
+            time.sleep(seconds)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _native_wash_one(self, sid: int, sub: Any) -> None:
+        """原生模式：一次只触发一个订阅，便于控制节奏（原来是整批一次性触发）。"""
+        name = str(getattr(sub, "name", "") or "")
+        try:
+            SubscribeChain().search(sids=(sid,), manual=True)
+            self._record(f"《{name}》已触发原生最佳版本搜索")
+        except Exception as e:  # noqa: BLE001
+            self._record(f"《{name}》原生搜索失败：{e}")
 
     # ------------------------------------------------------------------ #
     # 自定义权重模式：搜索 + 打分 + 下载更优版本
