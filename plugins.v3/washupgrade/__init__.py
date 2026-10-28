@@ -40,6 +40,18 @@ _DIMENSIONS = [
 ]
 _DEFAULT_WEIGHTS = [100, 70, 50, 40, 30, 20, 12, 8, 5]
 _RES_RANK = {"8K": 6, "4K": 5, "1080P": 4, "1080I": 3, "720P": 2, "SD": 1}
+# 各维度的中文名 + 一句通俗说明（用于配置页，避免英文术语看不懂）
+_DIM_ZH = {
+    "resolution":     ("分辨率",   "画面清晰度，如 8K / 4K / 1080P"),
+    "source":         ("来源",     "资源出处，如 蓝光原盘 / REMUX / WEB-DL"),
+    "video_codec":    ("视频编码", "压缩格式，如 HEVC / H.264 / AV1"),
+    "audio_codec":    ("音频编码", "声音格式，如 TrueHD / DTS / AAC"),
+    "hdr":            ("画质特效", "如 杜比视界 / HDR10 / SDR"),
+    "color_depth":    ("色深",     "色彩细腻度，如 10bit / 8bit"),
+    "frame_rate":     ("帧率",     "流畅度，如 60fps / 24fps"),
+    "subtitle":       ("字幕",     "如 简繁双语 / 简英 / 无字幕"),
+    "file_extension": ("文件格式", "如 MKV / MP4 / ISO"),
+}
 # 标题里常见的等价写法归一化
 _SYN = {"2160P": "4K", "2160": "4K", "CHS.CHT": "CHS&CHT", "CHT.CHS": "CHS&CHT", "CHS/CHT": "CHS&CHT"}
 
@@ -63,7 +75,7 @@ class WashUpgrade(_PluginBase):
     plugin_name = "洗版自用"
     plugin_desc = "评分洗版：原生最佳版本触发，或自定义权重打分覆盖 MP 原生规则。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "your-name"
     author_url = "https://github.com/your-name"
     plugin_config_prefix = "washupgrade_"
@@ -190,19 +202,31 @@ class WashUpgrade(_PluginBase):
     def get_form(self) -> tuple[list[dict], dict[str, Any]]:
         weight_items = []
         for i, (dim, _vals) in enumerate(_DIMENSIONS):
+            zh, desc = _DIM_ZH.get(dim, (dim, ""))
             weight_items.append({
                 "component": "VTextField",
                 "props": {
                     "model": f"{dim}_weight",
-                    "label": f"权重·{dim}（默认 {_DEFAULT_WEIGHTS[i]}）",
+                    "label": f"{zh}（重要度，默认 {_DEFAULT_WEIGHTS[i]}）",
                     "type": "number",
                     "placeholder": str(_DEFAULT_WEIGHTS[i]),
+                    "hint": desc,
+                    "persistent-hint": True,
                 },
             })
         return [
             {
                 "component": "VForm",
                 "content": [
+                    # ===== 分区一：基础设置 =====
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "text": "① 基础设置（通用开关与触发方式）",
+                        },
+                    },
                     {"component": "VSwitch", "props": {"model": "enabled", "label": "启用评分洗版"}},
                     {
                         "component": "VSelect",
@@ -219,7 +243,7 @@ class WashUpgrade(_PluginBase):
                         "component": "VSelect",
                         "props": {
                             "model": "scope",
-                            "label": "洗版范围",
+                            "label": "洗版范围（对哪些订阅生效）",
                             "items": [
                                 {"title": "全部订阅", "value": _SCOPE_ALL},
                                 {"title": "仅电影", "value": _SCOPE_MOVIE},
@@ -231,22 +255,22 @@ class WashUpgrade(_PluginBase):
                         "component": "VSwitch",
                         "props": {
                             "model": "only_best_version",
-                            "label": "仅对开启「最佳版本」的订阅洗版",
+                            "label": "仅对开启了「最佳版本」的订阅洗版",
                         },
                     },
                     {
                         "component": "VTextField",
                         "props": {
                             "model": "crontab",
-                            "label": "扫描周期 (Cron)",
-                            "placeholder": "0 4 * * *（每天 04:00）",
+                            "label": "扫描周期（定时触发，如 0 4 * * * = 每天 04:00）",
+                            "placeholder": "0 4 * * *",
                         },
                     },
                     {
                         "component": "VSwitch",
                         "props": {
                             "model": "dry_run",
-                            "label": "试运行（只记录将触发的订阅，不真正搜索/下载）",
+                            "label": "试运行（只记录将要洗版的订阅，不真正搜索/下载）",
                         },
                     },
                     {
@@ -254,23 +278,31 @@ class WashUpgrade(_PluginBase):
                         "props": {
                             "type": "info",
                             "variant": "tonal",
-                            "text": "「原生最佳版本」模式：评分规则与画质/特效目标请在 MoviePilot「洗版评分规则」页和订阅「最佳版本」里设置，本插件只负责触发。",
+                            "text": "「原生最佳版本」模式：评分规则与画质/特效目标请在 MoviePilot「洗版评分规则」页和订阅的「最佳版本」里设置，本插件只负责按时触发它们。",
                         },
                     },
+                    # ===== 分区二：自定义权重打分 =====
                     {
                         "component": "VAlert",
                         "props": {
                             "type": "warning",
                             "variant": "tonal",
-                            "text": "以下「自定义权重」设置仅在洗版模式 = 自定义权重打分 时生效。",
+                            "text": "② 自定义权重打分（仅在上方「洗版模式 = 自定义权重打分」时生效）"
+                                    "。「重要度」= 挑选更好版本时该项所占比重，数字越大越优先。"
+                                    "例如分辨率 100、文件格式 5，代表更看重清晰度、不太在意格式。"
+                                    "一般保持默认即可，无需修改。",
                         },
                     },
                     *weight_items,
                     {
+                        "component": "VDivider",
+                        "props": {"class": "my-3"},
+                    },
+                    {
                         "component": "VSelect",
                         "props": {
                             "model": "min_resolution",
-                            "label": "最低接受分辨率（自定义模式）",
+                            "label": "最低接受分辨率（低于此清晰度的不洗）",
                             "items": [
                                 {"title": "不限", "value": ""},
                                 {"title": "8K", "value": "8K"},
@@ -284,7 +316,7 @@ class WashUpgrade(_PluginBase):
                         "component": "VTextField",
                         "props": {
                             "model": "exclude_keywords",
-                            "label": "排除关键词（逗号分隔，自定义模式）",
+                            "label": "排除关键词（逗号分隔，标题含这些词就不洗）",
                             "placeholder": "国配,德语",
                         },
                     },
@@ -292,7 +324,7 @@ class WashUpgrade(_PluginBase):
                         "component": "VTextField",
                         "props": {
                             "model": "bonus_keywords",
-                            "label": "优先关键词（逗号分隔，命中加分，自定义模式）",
+                            "label": "优先关键词（逗号分隔，命中后额外加分）",
                             "placeholder": "DIY,REMUX",
                         },
                     },
@@ -300,7 +332,7 @@ class WashUpgrade(_PluginBase):
                         "component": "VTextField",
                         "props": {
                             "model": "score_threshold",
-                            "label": "评分提升阈值（自定义模式，新分需高于基线此值才下载）",
+                            "label": "评分提升阈值（新版本需比旧的高出这么多分才下载）",
                             "type": "number",
                             "placeholder": "0",
                         },
