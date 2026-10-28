@@ -74,7 +74,7 @@ class WashUpgrade(_PluginBase):
     plugin_name = "洗版自用"
     plugin_desc = "评分洗版：原生最佳版本触发，或自选类别打分覆盖 MP 原生规则。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.4.3"
+    plugin_version = "1.4.4"
     plugin_author = "your-name"
     author_url = "https://github.com/your-name"
     plugin_config_prefix = "washupgrade_"
@@ -100,8 +100,9 @@ class WashUpgrade(_PluginBase):
 
     # 内存活动缓存（在「数据」页展示）
     _activities: list[str] = []
-    # 自定义模式下，每个订阅已下载的最佳分（内存基线，重启清空，靠宿主去重兜底）
+    # 自定义模式下，每个订阅已下载的最佳分/标题（内存基线，重启清空，靠宿主去重兜底）
     _best_scores: dict[int, int] = {}
+    _best_titles: dict[int, str] = {}
     # 防止手动/定时并发重叠执行
     _running = False
 
@@ -632,9 +633,33 @@ class WashUpgrade(_PluginBase):
     # ------------------------------------------------------------------ #
     # 自定义权重模式：搜索 + 打分 + 下载更优版本
     # ------------------------------------------------------------------ #
+    def _current_version_title(self, sub: Any) -> str:
+        """取该订阅「当前已下载版本」的种子名，用于日志展示与基线推算。取不到返回空串。"""
+        name = str(getattr(sub, "name", "") or "")
+        year = str(getattr(sub, "year", "") or "")
+        mt = self._to_mtype(getattr(sub, "type", None))
+        if mt is MediaType.MOVIE:
+            mtype = "电影"
+        elif mt is MediaType.TV:
+            mtype = "电视剧"
+        else:
+            mtype = None
+        try:
+            from app.db.oper.downloadhistory import DownloadHistoryOper
+
+            recs = DownloadHistoryOper().get_last_by(
+                mtype=mtype, title=name, year=year or None
+            ) or []
+            if recs:
+                r = recs[0]
+                return str(getattr(r, "torrent_name", "") or getattr(r, "title", "") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+        return ""
+
     def _custom_wash_one(self, sid: int, sub: Any) -> None:
         name = str(getattr(sub, "name", "") or "")
-        year = getattr(sub, "type", None) and getattr(sub, "year", None)
+        year = getattr(sub, "year", None)
         stype = getattr(sub, "type", None)
         mtype = self._to_mtype(stype)
         search_title = name
@@ -646,48 +671,54 @@ class WashUpgrade(_PluginBase):
         try:
             contexts = SearchChain().search_by_title(search_title, mtype=mtype)
         except Exception as e:  # noqa: BLE001
-            self._record(f"[自定义] 《{name}》搜索失败：{e}")
+            self._record(f"《{name}》搜索失败：{e}")
             return
 
+        bonus = [k.strip() for k in self._bonus_keywords.split(",") if k.strip()]
         best_ctx: Any = None
+        best_title = ""
         best_score = -1
         for ctx in (contexts or []):
             ti = getattr(ctx, "torrent_info", None)
             t = getattr(ti, "title", None) if ti else getattr(ctx, "title", None)
-            if not t:
+            if not t or not self._passes_filters(t):
                 continue
-            if not self._passes_filters(t):
-                continue
-            s = self._score_title(
-                t,
-                self._dim_enabled,
-                self._dim_values,
-                [k.strip() for k in self._bonus_keywords.split(",") if k.strip()],
-            )
+            s = self._score_title(t, self._dim_enabled, self._dim_values, bonus)
             if s > best_score:
-                best_score, best_ctx = s, ctx
+                best_score, best_ctx, best_title = s, ctx, t
 
         if best_ctx is None:
-            self._record(f"[自定义] 《{name}》未找到符合过滤条件的更优资源")
+            self._record(f"《{name}》未找到符合过滤条件的资源，跳过")
             return
 
-        base = self._best_scores.get(sid, -1)
-        if best_score > base and (best_score - base) >= self._score_threshold:
+        # 1) 当前版本：优先取已下载记录里的种子名，其次用本插件上次下载记录
+        cur_title = self._current_version_title(sub) or self._best_titles.get(sid, "")
+        if cur_title:
+            cur_score = self._score_title(cur_title, self._dim_enabled, self._dim_values, bonus)
+        else:
+            cur_score = self._best_scores.get(sid, -1)
+        cur_text = cur_score if cur_score >= 0 else "未知"
+        self._record(f"《{name}》当前版本：{cur_title or '未记录'}（评分 {cur_text}）")
+
+        # 2) 对比：是否发现更高版本
+        if best_score > cur_score and (best_score - cur_score) >= self._score_threshold:
+            self._record(f"《{name}》对比后发现更高版本：{best_title}（评分 {best_score}）")
+            # 3) 进行评分洗版
             if self._dry_run:
-                self._record(
-                    f"[自定义][试运行] 《{name}》发现更优资源 评分={best_score}（基线={base}），将下载"
-                )
+                self._record(f"《{name}》[试运行] 将进行评分洗版（不实际下载）")
                 return
+            self._record(f"《{name}》进行评分洗版：开始下载")
             try:
                 DownloadChain().download_single(best_ctx)
                 self._best_scores[sid] = best_score
-                self._record(f"[自定义] 《{name}》已下载更优资源 评分={best_score}")
+                self._best_titles[sid] = best_title
+                self._record(f"《{name}》评分洗版已提交下载（评分 {best_score}）")
             except Exception as e:  # noqa: BLE001
-                self._record(f"[自定义] 《{name}》下载失败：{e}")
+                self._record(f"《{name}》下载失败：{e}")
         else:
             self._record(
-                f"[自定义] 《{name}》当前最佳 评分={best_score} 未高于基线 {base}"
-                f"（差 {best_score - base}，阈值 {self._score_threshold}）"
+                f"《{name}》对比后未发现更高版本：最佳候选 {best_title}"
+                f"（评分 {best_score}），保持当前版本"
             )
 
     # ------------------------------------------------------------------ #
