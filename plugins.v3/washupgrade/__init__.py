@@ -25,6 +25,11 @@ _SCOPE_TV = "tv"
 _MODE_NATIVE = "native"   # 复用 MoviePilot 原生最佳版本搜索（全局评分规则 + 订阅目标）
 _MODE_CUSTOM = "custom"   # 自定义类别打分，覆盖 MP 原生规则
 
+# 电视剧洗版策略（分集 / 全集）
+_TV_AUTO = "auto"          # 分集也洗；一旦出现全集/整季包，自动转全集洗版（推荐）
+_TV_PACK_ONLY = "pack_only"  # 只等全集/整季包，分集一律不洗
+_TV_EPISODE = "episode"    # 只按分集洗，不区分全集（等同旧行为）
+
 # 9 维评分维度（顺序 = 优先级 #1 → #9，与 MP「洗版评分规则」页一致）
 _DIMENSIONS = [
     ("resolution", ["8K", "4K", "1080P", "1080I", "720P", "SD"]),
@@ -57,6 +62,26 @@ _DIM_ZH = {
 }
 # 标题里常见的等价写法归一化
 _SYN = {"2160P": "4K", "2160": "4K", "CHS.CHT": "CHS&CHT", "CHT.CHS": "CHS&CHT", "CHS/CHT": "CHS&CHT"}
+_SYN_CACHE: dict[str, set[str]] = {}
+
+
+def _variants(tok: str) -> set[str]:
+    """某个类别在标题里的所有等价写法（如 4K ↔ 2160P、CHS&CHT ↔ CHS.CHT）。
+
+    PT 站点大多写 2160P 而不是 4K，必须双向映射，否则分辨率维度会整体失配。
+    """
+    cached = _SYN_CACHE.get(tok)
+    if cached is not None:
+        return cached
+    out = {tok}
+    canon = _SYN.get(tok)
+    if canon:
+        out.add(canon)
+    for k, v in _SYN.items():
+        if v == tok:
+            out.add(k)
+    _SYN_CACHE[tok] = out
+    return out
 
 
 class WashUpgrade(_PluginBase):
@@ -69,6 +94,12 @@ class WashUpgrade(_PluginBase):
     - 自定义类别打分：插件按你在配置页勾选的类别（分辨率/来源/视频编码…）自行打分，
       搜索并下载更优版本，覆盖 MP 原生规则，做精细控制。
 
+    电视剧分集/全集：默认「分集也洗，出全集后自动转全集」——追更期间按分集洗画质，
+    站点一旦出现全集/整季包就自动转洗全集，洗到全集即收工。
+
+    洗版封顶：达到目标画质、洗满次数、连续多轮没有更优资源、或已洗到全集，
+    该订阅即判定「洗版完成」，不再检测、不再访问站点，并从详情页列表移除（可一键重置）。
+
     资源来源：MoviePilot 已配置的 PT 站点（由宿主搜索/下载链负责）。
 
     日志：写入宿主插件日志（logs/plugins/washupgrade.log）与内存活动缓存
@@ -76,9 +107,9 @@ class WashUpgrade(_PluginBase):
     """
 
     plugin_name = "洗版自用"
-    plugin_desc = "评分洗版：原生最佳版本触发，或自选类别打分覆盖 MP 原生规则。"
+    plugin_desc = "评分洗版：原生触发或自选类别打分；电视剧分集也洗、出全集自动转全集；洗到目标即停并从首页移除。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.4.6"
+    plugin_version = "1.5.0"
     plugin_author = "your-name"
     author_url = "https://github.com/your-name"
     plugin_config_prefix = "washupgrade_"
@@ -104,7 +135,15 @@ class WashUpgrade(_PluginBase):
     _interval_seconds = 60      # 每处理完一个订阅后等待的秒数（含随机抖动）
     _batch_limit = 10           # 每轮最多处理多少个订阅（0 = 不限），其余下轮轮转
     _cooldown_hours = 12        # 同一订阅的冷却小时数，冷却内跳过（0 = 不限）
-    _full_season_only = True    # 自定义模式下，电视剧只在出现「全集/整季」时才洗版
+    _tv_mode = _TV_AUTO         # 电视剧：分集也洗，出全集后自动转全集
+    # 洗版封顶：达到这些条件后该订阅不再检测、不再洗版
+    _max_wash_times = 2         # 同一订阅最多洗几次（0 = 不限）
+    _target_resolution = "4K"   # 洗到这个分辨率即封顶（"" = 不按分辨率封顶）
+    _target_source = ""         # 洗到这个来源即封顶（"" = 不按来源封顶）
+    _stop_on_complete_pack = True   # 电视剧洗到全集即视为完成
+    _give_up_rounds = 3         # 连续这么多轮没找到更优版本就收工（0 = 不放弃）
+    _hide_done = True           # 已完成的订阅从详情页移除
+    _done: dict[str, dict] = {}  # 已完成洗版的订阅（持久化）
     _cursor = 0                 # 分批轮转起点
     _last_wash_at: dict[int, float] = {}   # 订阅 id -> 上次洗版时间戳
     _ver_cache: dict[int, tuple[str, float]] = {}   # 订阅 id -> (当前版本标题, 缓存时间)
@@ -148,8 +187,26 @@ class WashUpgrade(_PluginBase):
         self._interval_seconds = self._to_int(config.get("interval_seconds"), 60, 0, 3600)
         self._batch_limit = self._to_int(config.get("batch_limit"), 10, 0, 500)
         self._cooldown_hours = self._to_int(config.get("cooldown_hours"), 12, 0, 720)
-        self._full_season_only = bool(config.get("full_season_only", True))
-        # 冷却记录/轮转游标/版本缓存：跨配置重载保留，但每个实例独立一份
+        # 电视剧分集/全集策略（兼容旧配置里的 full_season_only 布尔开关）
+        raw_tv_mode = config.get("tv_mode")
+        if raw_tv_mode in (_TV_AUTO, _TV_PACK_ONLY, _TV_EPISODE):
+            self._tv_mode = str(raw_tv_mode)
+        elif "full_season_only" in config:
+            legacy = bool(config.get("full_season_only"))
+            self._tv_mode = _TV_PACK_ONLY if legacy else _TV_EPISODE
+        else:
+            self._tv_mode = _TV_AUTO
+        # 洗版封顶（到达后不再检测、不再洗版）
+        self._max_wash_times = self._to_int(config.get("max_wash_times"), 2, 0, 100)
+        # 注意：区分「键不存在」（用默认 4K）与「显式选了不封顶」（空串）
+        raw_target_res = config.get("target_resolution", "4K")
+        self._target_resolution = str(raw_target_res if raw_target_res is not None else "").strip().upper()
+        raw_target_src = config.get("target_source", "")
+        self._target_source = str(raw_target_src if raw_target_src is not None else "").strip().upper()
+        self._stop_on_complete_pack = bool(config.get("stop_on_complete_pack", True))
+        self._give_up_rounds = self._to_int(config.get("give_up_rounds"), 3, 0, 100)
+        self._hide_done = bool(config.get("hide_done", True))
+        # 冷却记录/轮转游标/版本缓存/完成状态：跨配置重载保留，但每个实例独立一份
         if "_last_wash_at" not in self.__dict__:
             self._last_wash_at = {}
         if "_cursor" not in self.__dict__:
@@ -160,6 +217,7 @@ class WashUpgrade(_PluginBase):
             self._best_scores = {}
         if "_best_titles" not in self.__dict__:
             self._best_titles = {}
+        self._load_done()
         self._record("插件已加载 / 重新配置")
         # 「立即运行一次」开关：保存配置时若为开，则触发一次并自动复位为关，避免重启重复执行
         self._run_once = bool(config.get("run_once"))
@@ -233,6 +291,169 @@ class WashUpgrade(_PluginBase):
         ordered = [v for v in all_vals if v in picked]
         return ordered or list(all_vals)
 
+    # ------------------------------------------------------------------ #
+    # 洗版封顶：达到目标程度后不再检测、不再洗版
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def _dim_index(cls, dim: str, title: str) -> int:
+        """返回标题在该维度里命中的最优类别下标（越小越优），未命中返回 -1。"""
+        if not title:
+            return -1
+        vals = dict(_DIMENSIONS).get(dim) or []
+        tu = cls._norm_title(title)
+        ext = tu.rsplit(".", 1)[-1] if "." in tu else ""
+        for idx, tok in enumerate(vals):
+            vs = _variants(tok)
+            if dim == "file_extension":
+                if ext in vs:
+                    return idx
+            elif any(
+                v in tu or v.replace("&", ".") in tu or v.replace(".", "&") in tu for v in vs
+            ):
+                return idx
+        return -1
+
+    def _reached_target(self, title: str) -> bool:
+        """当前版本是否已经洗到目标档位（分辨率/来源）。用于「到顶就不再洗」。"""
+        if not title:
+            return False
+        res_all = dict(_DIMENSIONS)["resolution"]
+        if self._target_resolution:
+            if self._target_resolution in res_all:
+                need = res_all.index(self._target_resolution)
+                got = self._dim_index("resolution", title)
+                if got < 0 or got > need:
+                    return False
+            # 目标值不在候选表里就忽略这一项，避免配置写错导致永不封顶
+        if self._target_source:
+            src_all = dict(_DIMENSIONS)["source"]
+            if self._target_source in src_all:
+                need = src_all.index(self._target_source)
+                got = self._dim_index("source", title)
+                if got < 0 or got > need:
+                    return False
+        return True
+
+    def _load_done(self) -> None:
+        """载入「已完成洗版」记录（持久化在插件数据里）。"""
+        if "_done" not in self.__dict__:
+            data = None
+            try:
+                data = self.get_data("done")
+            except Exception:  # noqa: BLE001
+                data = None
+            self._done = data if isinstance(data, dict) else {}
+
+    def _save_done(self) -> None:
+        try:
+            self.save_data("done", self._done)
+        except Exception as e:  # noqa: BLE001
+            self._record(f"保存洗版完成状态失败：{e}")
+
+    @staticmethod
+    def _done_key(sub: Any) -> str:
+        name = str(getattr(sub, "name", "") or "")
+        year = str(getattr(sub, "year", "") or "")
+        stype = str(getattr(sub, "type", "") or "")
+        return f"{stype}|{name}|{year}"
+
+    def _may_finish_early(self, sub: Any, st: dict | None) -> bool:
+        """电视剧在「等全集」阶段，即使画质到顶也不算完成——还要等全集来转。
+
+        否则分集先洗到 4K 就会立刻收工，永远等不到自动转全集。
+        """
+        st = st or {}
+        if self._stop_on_complete_pack and self._tv_mode == _TV_AUTO and not st.get("pack"):
+            if self._to_mtype(getattr(sub, "type", None)) is MediaType.TV:
+                return False
+        return True
+
+    def _done_reason(self, sub: Any, cur_title: str = "") -> str:
+        """若该订阅已洗到封顶，返回原因（非空即不再检测）；否则返回空串。"""
+        st = self._done.get(self._done_key(sub)) or {}
+        if st.get("reason"):
+            return str(st["reason"])
+        times = self._to_int(st.get("count", 0), 0, 0, 10000)
+        if self._max_wash_times > 0 and times >= self._max_wash_times:
+            return f"已洗版 {times} 次，达到次数上限"
+        if self._stop_on_complete_pack and st.get("pack"):
+            return "已洗到全集/整季包"
+        # 「已达目标画质」只在插件确实洗过之后才算数，否则重置/手动达标会立刻又被判完成
+        if (times > 0 and cur_title and self._may_finish_early(sub, st)
+                and self._reached_target(cur_title)):
+            return f"当前版本已达目标画质（{self._target_resolution or '—'}）"
+        return ""
+
+    def _mark_wash(self, sub: Any, cur_title: str, is_pack: bool = False) -> str:
+        """记录一次洗版，返回是否就此封顶（返回原因字符串，空串表示还能继续洗）。"""
+        key = self._done_key(sub)
+        st = self._done.get(key)
+        if not isinstance(st, dict):
+            st = {}
+        st["count"] = self._to_int(st.get("count", 0), 0, 0, 10000) + 1
+        if is_pack:
+            st["pack"] = True
+        st["at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st["title"] = cur_title
+        reason = ""
+        if self._stop_on_complete_pack and st.get("pack"):
+            reason = "已洗到全集/整季包"
+        elif self._max_wash_times > 0 and st["count"] >= self._max_wash_times:
+            reason = f"已洗版 {st['count']} 次，达到次数上限"
+        elif (cur_title and self._may_finish_early(sub, st)
+                and self._reached_target(cur_title)):
+            reason = f"已洗到目标画质（{self._target_resolution or '—'}）"
+        st["reason"] = reason
+        self._done[key] = st
+        self._save_done()
+        return reason
+
+    def reset_done(self) -> dict[str, Any]:
+        """清空「已完成洗版」记录，让所有订阅重新参与洗版。"""
+        n = len(self._done)
+        self._done = {}
+        self._save_done()
+        self._record(f"已重置洗版完成状态，{n} 个订阅重新参与洗版")
+        return {"success": True, "message": f"已重置 {n} 个订阅的完成状态。"}
+
+    def _set_done(self, sub: Any, reason: str, title: str = "") -> None:
+        """直接标记完成（不增加洗版次数），用于「已达目标画质」这类收工判定。"""
+        key = self._done_key(sub)
+        st = self._done.get(key)
+        if not isinstance(st, dict):
+            st = {}
+        st["reason"] = reason
+        st["at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if title:
+            st["title"] = title
+        self._done[key] = st
+        self._save_done()
+
+    def _count_miss(self, sub: Any, cur_title: str = "") -> str:
+        """累计「本轮没找到更优版本」的次数，连续太多次就判定洗版结束。"""
+        if self._give_up_rounds <= 0:
+            return ""
+        # 电视剧还在等全集时不能放弃，否则永远等不到「自动转全集」
+        if not self._may_finish_early(sub, self._done.get(self._done_key(sub))):
+            return ""
+        key = self._done_key(sub)
+        st = self._done.get(key)
+        if not isinstance(st, dict):
+            st = {}
+        st["miss"] = self._to_int(st.get("miss", 0), 0, 0, 10000) + 1
+        st["at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if cur_title:
+            st["title"] = cur_title
+        if st["miss"] >= self._give_up_rounds:
+            reason = f"连续 {st['miss']} 轮没有更优资源，判定已洗到顶"
+            st["reason"] = reason
+            self._done[key] = st
+            self._save_done()
+            return reason
+        self._done[key] = st
+        self._save_done()
+        return ""
+
     @classmethod
     def _score_title(
         cls,
@@ -263,13 +484,16 @@ class WashUpgrade(_PluginBase):
             dim_weight = n_dims - idx  # #1 最重，逐级递减
             matched_rank: int | None = None
             for tok in sorted(chosen, key=len, reverse=True):
-                tgt = _SYN.get(tok, tok)
+                vs = _variants(tok)
                 if dim == "file_extension":
-                    if ext == tgt:
+                    if ext in vs:
                         matched_rank = chosen.index(tok)
                         break
                 else:
-                    if tgt in tu or tgt.replace("&", ".") in tu or tgt.replace(".", "&") in tu:
+                    if any(
+                        v in tu or v.replace("&", ".") in tu or v.replace(".", "&") in tu
+                        for v in vs
+                    ):
                         matched_rank = chosen.index(tok)
                         break
             if matched_rank is not None:
@@ -363,10 +587,15 @@ class WashUpgrade(_PluginBase):
                         },
                     },
                     {
-                        "component": "VSwitch",
+                        "component": "VSelect",
                         "props": {
-                            "model": "full_season_only",
-                            "label": "电视剧只在出现「全集/整季」时才洗版（分集转全集，自定义模式生效）",
+                            "model": "tv_mode",
+                            "label": "电视剧洗版方式（分集 / 全集）",
+                            "items": [
+                                {"title": "分集也洗，出全集后自动转全集（推荐）", "value": _TV_AUTO},
+                                {"title": "只等全集，分集不洗", "value": _TV_PACK_ONLY},
+                                {"title": "只按分集洗，不区分全集", "value": _TV_EPISODE},
+                            ],
                         },
                     },
                     {
@@ -437,6 +666,76 @@ class WashUpgrade(_PluginBase):
                             "placeholder": "12",
                         },
                     },
+                    # ===== 分区：洗到什么时候停（防止无限洗版） =====
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "success",
+                            "variant": "tonal",
+                            "text": "洗到什么时候停：不设上限会一直反复检测、反复洗版。"
+                                    "满足下面任意一条就算「洗版完成」，该订阅不再检测、不再访问站点，"
+                                    "并从详情页列表移除。想重洗时点详情页的「重置完成状态」。",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "max_wash_times",
+                            "label": "同一订阅最多洗几次（默认 2：一次分集/电影 + 一次全集；0 = 不限）",
+                            "type": "number",
+                            "placeholder": "2",
+                        },
+                    },
+                    {
+                        "component": "VSelect",
+                        "props": {
+                            "model": "target_resolution",
+                            "label": "洗到这个分辨率就算到顶（不再洗）",
+                            "items": [
+                                {"title": "8K", "value": "8K"},
+                                {"title": "4K（推荐）", "value": "4K"},
+                                {"title": "1080P", "value": "1080P"},
+                                {"title": "720P", "value": "720P"},
+                                {"title": "不按分辨率封顶", "value": ""},
+                            ],
+                        },
+                    },
+                    {
+                        "component": "VSelect",
+                        "props": {
+                            "model": "target_source",
+                            "label": "洗到这个来源就算到顶（可选，一般不用设）",
+                            "items": [
+                                {"title": "不按来源封顶（默认）", "value": ""},
+                                {"title": "REMUX / 原盘级", "value": "REMUX"},
+                                {"title": "BLURAY（蓝光）", "value": "BLURAY"},
+                                {"title": "WEB-DL（网页）", "value": "WEB-DL"},
+                            ],
+                        },
+                    },
+                    {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "stop_on_complete_pack",
+                            "label": "电视剧洗到「全集/整季」即视为完成（不再洗单集）",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "give_up_rounds",
+                            "label": "连续几轮没找到更优版本就收工（默认 3；0 = 不放弃）",
+                            "type": "number",
+                            "placeholder": "3",
+                        },
+                    },
+                    {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "hide_done",
+                            "label": "洗版完成的订阅从详情页移除（只显示还在洗的）",
+                        },
+                    },
                     # ===== 分区二：自定义类别选择 =====
                     {
                         "component": "VAlert",
@@ -505,13 +804,19 @@ class WashUpgrade(_PluginBase):
             "wash_mode": _MODE_NATIVE,
             "scope": _SCOPE_ALL,
             "only_best_version": True,
-            "full_season_only": True,
+            "tv_mode": _TV_AUTO,
             "crontab": "0 4 * * *",
             "dry_run": True,
             "run_once": False,
             "interval_seconds": 60,
             "batch_limit": 10,
             "cooldown_hours": 12,
+            "max_wash_times": 2,
+            "target_resolution": "4K",
+            "target_source": "",
+            "stop_on_complete_pack": True,
+            "give_up_rounds": 3,
+            "hide_done": True,
             **{f"{dim}_enabled": True for dim, _v in _DIMENSIONS},
             **{f"{dim}_values": list(vals) for dim, vals in _DIMENSIONS},
             "min_resolution": "",
@@ -533,7 +838,8 @@ class WashUpgrade(_PluginBase):
             "text": (
                 f"{'运行中' if self._enabled else '已停用'} · {mode_text} · "
                 f"{'试运行' if self._dry_run else '正式'} · 间隔 {self._interval_seconds}s · "
-                f"每轮 {self._batch_limit or '不限'} · 冷却 {self._cooldown_hours}h"
+                f"每轮 {self._batch_limit or '不限'} · 冷却 {self._cooldown_hours}h · "
+                f"洗到 {self._target_resolution or '不限'} 停 · 最多洗 {self._max_wash_times or '不限'} 次"
             ),
         })
 
@@ -549,21 +855,39 @@ class WashUpgrade(_PluginBase):
                 "props": {"type": "warning", "variant": "tonal", "text": f"读取订阅失败：{err}"},
             })
         else:
-            cards = [self._sub_card(s) for s in subs[:30] if getattr(s, "name", None)]
+            pending: list[Any] = []
+            finished: list[Any] = []
+            for s in subs:
+                if not getattr(s, "name", None):
+                    continue
+                reason = self._done_reason(s, self._current_version_cached(s))
+                (finished if reason else pending).append(s)
+            shown = pending if self._hide_done else (pending + finished)
+            cards = [self._sub_card(s) for s in shown[:30]]
             if cards:
                 nodes.extend(cards)
-                if len(subs) > 30:
+                if len(shown) > 30:
                     nodes.append({
                         "component": "VCardText",
                         "props": {"class": "pa-0 px-1 text-caption text-medium-emphasis"},
-                        "text": f"共 {len(subs)} 个订阅，此处只显示前 30 个",
+                        "text": f"共 {len(shown)} 个订阅，此处只显示前 30 个",
                     })
             else:
                 nodes.append({
                     "component": "VCardText",
                     "props": {"class": "pa-0 px-1 text-caption text-medium-emphasis"},
-                    "text": "暂无订阅",
+                    "text": "暂无待洗版订阅" if finished else "暂无订阅",
                 })
+            if finished:
+                nodes.append({
+                    "component": "VCardText",
+                    "props": {"class": "pa-0 px-1 text-caption text-medium-emphasis"},
+                    "text": (
+                        f"已完成洗版 {len(finished)} 个"
+                        + ("（已从列表移除）" if self._hide_done else "（仍在列表中）")
+                    ),
+                })
+                nodes.append(self._reset_card(len(finished)))
 
         nodes.append({
             "component": "VCardText",
@@ -604,6 +928,33 @@ class WashUpgrade(_PluginBase):
                     "events": {
                         "click": {
                             "api": f"plugin/{self.__class__.__name__}/run",
+                            "method": "POST",
+                            "params": {},
+                        }
+                    },
+                }
+            ],
+        }
+
+    def _reset_card(self, count: int) -> dict:
+        """已完成洗版的订阅可以一键重置，重新参与洗版。"""
+        return {
+            "component": "VCard",
+            "props": {"variant": "tonal", "color": "surface-variant", "class": "mb-3 mt-1 pa-1"},
+            "content": [
+                {
+                    "component": "VBtn",
+                    "props": {
+                        "color": "secondary",
+                        "variant": "text",
+                        "block": True,
+                        "size": "small",
+                        "prepend-icon": "mdi-restore",
+                        "text": f"重置完成状态（{count} 个）",
+                    },
+                    "events": {
+                        "click": {
+                            "api": f"plugin/{self.__class__.__name__}/reset_done",
                             "method": "POST",
                             "params": {},
                         }
@@ -734,7 +1085,14 @@ class WashUpgrade(_PluginBase):
                 "methods": ["POST"],
                 "summary": "立即洗版一次",
                 "allow_anonymous": True,
-            }
+            },
+            {
+                "path": "/reset_done",
+                "endpoint": self.reset_done,
+                "methods": ["POST"],
+                "summary": "重置洗版完成状态",
+                "allow_anonymous": True,
+            },
         ]
 
     def get_command(self) -> list[dict[str, Any]]:
@@ -810,6 +1168,7 @@ class WashUpgrade(_PluginBase):
             return
 
         targets: list[tuple[int, Any]] = []
+        done_skipped = 0
         for sub in subs:
             try:
                 sid = int(sub.id)
@@ -827,7 +1186,16 @@ class WashUpgrade(_PluginBase):
                 continue
             if self._scope == _SCOPE_TV and mtype is not MediaType.TV:
                 continue
+            # 已洗到封顶的订阅直接跳过，不再访问站点（避免无限检测）
+            cur = self._current_version_cached(sub) if self._wash_mode == _MODE_CUSTOM else ""
+            reason = self._done_reason(sub, cur)
+            if reason:
+                done_skipped += 1
+                continue
             targets.append((sid, sub))
+
+        if done_skipped:
+            self._record(f"已完成洗版：{done_skipped} 个订阅已到顶，本轮跳过（不访问站点）")
 
         if not targets:
             self._last_run = "本次无可洗版订阅"
@@ -931,11 +1299,23 @@ class WashUpgrade(_PluginBase):
     def _native_wash_one(self, sid: int, sub: Any) -> None:
         """原生模式：一次只触发一个订阅，便于控制节奏（原来是整批一次性触发）。"""
         name = str(getattr(sub, "name", "") or "")
+        cur = self._current_version_cached(sub)
+        if cur and self._reached_target(cur):
+            self._set_done(sub, f"当前版本已达目标画质（{self._target_resolution or '—'}）", cur)
+            self._record(
+                f"《{name}》已达目标画质（{self._target_resolution or '—'}），跳过触发，"
+                f"后续不再检测，已从首页移除"
+            )
+            return
         try:
             SubscribeChain().search(sids=(sid,), manual=True)
             self._record(f"《{name}》已触发原生最佳版本搜索")
         except Exception as e:  # noqa: BLE001
             self._record(f"《{name}》原生搜索失败：{e}")
+            return
+        reason = self._mark_wash(sub, cur, is_pack=False)
+        if reason:
+            self._record(f"《{name}》洗版完成 → {reason}，后续不再检测，已从首页移除")
 
     # ------------------------------------------------------------------ #
     # 自定义权重模式：搜索 + 打分 + 下载更优版本
@@ -969,6 +1349,11 @@ class WashUpgrade(_PluginBase):
         year = getattr(sub, "year", None)
         stype = getattr(sub, "type", None)
         mtype = self._to_mtype(stype)
+        # 已洗到封顶的订阅不再搜索（不产生任何站点请求）
+        early = self._done_reason(sub, self._current_version_cached(sub))
+        if early:
+            self._record(f"《{name}》已完成洗版（{early}），跳过检测")
+            return
         search_title = name
         try:
             if year and int(year) > 0:
@@ -984,65 +1369,125 @@ class WashUpgrade(_PluginBase):
         bonus = [k.strip() for k in self._bonus_keywords.split(",") if k.strip()]
         is_tv = mtype is MediaType.TV
         total_ep = self._to_int(getattr(sub, "total_episode", 0), 0, 0, 10000)
-        skipped_single = 0
-        best_ctx: Any = None
-        best_title = ""
-        best_score = -1
+
+        # 候选分成「全集/整季包」与「分集」两堆
+        packs: list[tuple[int, Any, str]] = []
+        singles: list[tuple[int, Any, str]] = []
         for ctx in (contexts or []):
             ti = getattr(ctx, "torrent_info", None)
             t = getattr(ti, "title", None) if ti else getattr(ctx, "title", None)
             if not t or not self._passes_filters(t):
                 continue
-            # 电视剧画质洗版不应被单集资源触发；只在出现全集/整季时才洗（分集转全集）
-            if is_tv and self._full_season_only and not self._is_complete_pack(t, total_ep):
-                skipped_single += 1
-                continue
             s = self._score_title(t, self._dim_enabled, self._dim_values, bonus)
-            if s > best_score:
-                best_score, best_ctx, best_title = s, ctx, t
-
-        if skipped_single:
-            self._record(
-                f"《{name}》跳过 {skipped_single} 个分集资源（设置：电视剧只在出现全集时洗版）"
-            )
-
-        if best_ctx is None:
-            if is_tv and self._full_season_only and skipped_single:
-                self._record(f"《{name}》暂无全集资源，继续等分集攒齐后转全集洗版")
+            if is_tv and self._is_complete_pack(t, total_ep):
+                packs.append((s, ctx, t))
             else:
-                self._record(f"《{name}》未找到符合过滤条件的资源，跳过")
-            return
+                singles.append((s, ctx, t))
 
-        # 1) 当前版本：优先取已下载记录里的种子名，其次用本插件上次下载记录
+        # 当前版本（分集/全集判断与基线都依赖它）
         cur_title = self._current_version_title(sub) or self._best_titles.get(sid, "")
+        cur_is_pack = bool(is_tv and cur_title and self._is_complete_pack(cur_title, total_ep))
         if cur_title:
             cur_score = self._score_title(cur_title, self._dim_enabled, self._dim_values, bonus)
         else:
             cur_score = self._best_scores.get(sid, -1)
         cur_text = cur_score if cur_score >= 0 else "未知"
+
+        # ---- 按「电视剧分集/全集策略」决定候选池 ----
+        if is_tv and self._tv_mode == _TV_PACK_ONLY:
+            if not packs:
+                self._record(f"《{name}》暂无全集/整季资源，继续等全集（设置：只等全集）")
+                return
+            pool = packs
+        elif is_tv and self._tv_mode == _TV_AUTO:
+            if packs:
+                pool = packs
+                if not cur_is_pack:
+                    self._record(f"《{name}》发现 {len(packs)} 个全集/整季资源 → 自动转全集洗版")
+            else:
+                if cur_is_pack:
+                    self._record(f"《{name}》当前已是全集版本，站点暂无更优全集，本次不洗")
+                    return
+                pool = singles
+                if singles:
+                    self._record(
+                        f"《{name}》暂无全集，按分集洗版（追更中，共 {len(singles)} 个分集候选）"
+                    )
+        else:
+            pool = packs + singles
+
+        # ---- 选最优候选 ----
+        best_score, best_ctx, best_title = -1, None, ""
+        for s, ctx, t in pool:
+            if s > best_score:
+                best_score, best_ctx, best_title = s, ctx, t
+
         self._record(f"《{name}》当前版本：{cur_title or '未记录'}（评分 {cur_text}）")
 
-        # 2) 对比：是否发现更高版本
-        if best_score > cur_score and (best_score - cur_score) >= self._score_threshold:
-            tag = "（全集）" if (is_tv and self._is_complete_pack(best_title, total_ep)) else ""
-            self._record(f"《{name}》对比后发现更高版本{tag}：{best_title}（评分 {best_score}）")
-            # 3) 进行评分洗版
-            if self._dry_run:
-                self._record(f"《{name}》[试运行] 将进行评分洗版（不实际下载）")
-                return
-            self._record(f"《{name}》进行评分洗版：开始下载")
-            try:
-                DownloadChain().download_single(best_ctx)
-                self._best_scores[sid] = best_score
-                self._best_titles[sid] = best_title
-                self._record(f"《{name}》评分洗版已提交下载（评分 {best_score}）")
-            except Exception as e:  # noqa: BLE001
-                self._record(f"《{name}》下载失败：{e}")
+        if best_ctx is None:
+            # 没找到任何可用资源：累计空转轮次，连续太多次就收工，别一直扫
+            self._record(f"《{name}》未找到符合过滤条件的资源，跳过")
+            miss_reason = self._count_miss(sub, cur_title)
+            if miss_reason:
+                self._record(f"《{name}》洗版结束 → {miss_reason}，后续不再检测")
+            return
+
+        best_is_pack = bool(is_tv and self._is_complete_pack(best_title, total_ep))
+
+        # 已是全集时不再用分集覆盖（防止把全集洗成单集）
+        if cur_is_pack and not best_is_pack:
+            self._record(f"《{name}》当前已是全集版本，不接受分集覆盖，本次不洗")
+            return
+
+        if best_is_pack and not cur_is_pack:
+            # 分集 → 全集：这是「转全集洗版」，必须执行，不比较分数
+            self._record(
+                f"《{name}》出现全集资源：{best_title}（评分 {best_score}）→ 自动转全集洗版"
+            )
+            improved = True
         else:
+            improved = best_score > cur_score and (best_score - cur_score) >= self._score_threshold
+            if improved:
+                self._record(
+                    f"《{name}》对比后发现更高版本：{best_title}（评分 {best_score}）"
+                )
+
+        if not improved:
             self._record(
                 f"《{name}》对比后未发现更高版本：最佳候选 {best_title}"
                 f"（评分 {best_score}），保持当前版本"
             )
+            if (cur_title and self._reached_target(cur_title)
+                    and self._may_finish_early(sub, self._done.get(self._done_key(sub)))):
+                self._set_done(
+                    sub, f"当前版本已达目标画质（{self._target_resolution or '—'}）", cur_title
+                )
+                self._record(
+                    f"《{name}》洗版结束 → 已达目标画质（{self._target_resolution or '—'}），"
+                    f"后续不再检测，已从首页移除"
+                )
+                return
+            miss_reason = self._count_miss(sub, cur_title)
+            if miss_reason:
+                self._record(f"《{name}》洗版结束 → {miss_reason}，后续不再检测")
+            return
+
+        # ---- 进行评分洗版 ----
+        if self._dry_run:
+            self._record(f"《{name}》[试运行] 将进行评分洗版（不实际下载）")
+            return
+        self._record(f"《{name}》进行评分洗版：开始下载")
+        try:
+            DownloadChain().download_single(best_ctx)
+        except Exception as e:  # noqa: BLE001
+            self._record(f"《{name}》下载失败：{e}")
+            return
+        self._best_scores[sid] = best_score
+        self._best_titles[sid] = best_title
+        self._record(f"《{name}》评分洗版已提交下载（评分 {best_score}）")
+        reason = self._mark_wash(sub, best_title, is_pack=best_is_pack)
+        if reason:
+            self._record(f"《{name}》洗版完成 → {reason}，后续不再检测，已从首页移除")
 
     # ------------------------------------------------------------------ #
     # 停用：释放后台资源
