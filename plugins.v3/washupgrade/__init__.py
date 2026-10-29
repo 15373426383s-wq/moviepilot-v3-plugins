@@ -114,9 +114,9 @@ class WashUpgrade(_PluginBase):
     plugin_name = "洗版自用"
     plugin_desc = "评分洗版：分集也洗、出全集自动转全集（但不降画质）；9 个维度可分别设「洗到哪一档就停」。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.6.0"
-    plugin_author = "your-name"
-    author_url = "https://github.com/your-name"
+    plugin_version = "1.6.1"
+    plugin_author = "15373426383s-wq"
+    author_url = "https://github.com/15373426383s-wq"
     plugin_config_prefix = "washupgrade_"
     plugin_order = 50
     auth_level = 1
@@ -411,9 +411,12 @@ class WashUpgrade(_PluginBase):
         """电视剧在「等全集」阶段，即使画质到顶也不算完成——还要等全集来转。
 
         否则分集先洗到 4K 就会立刻收工，永远等不到自动转全集。
+        「只等全集」模式同理：用户明确要求等全集，就不能因为连续几轮没有更优而放弃。
         """
         st = st or {}
-        if self._stop_on_complete_pack and self._tv_mode == _TV_AUTO and not st.get("pack"):
+        if (self._stop_on_complete_pack
+                and self._tv_mode in (_TV_AUTO, _TV_PACK_ONLY)
+                and not st.get("pack")):
             if self._to_mtype(getattr(sub, "type", None)) is MediaType.TV:
                 return False
         return True
@@ -670,12 +673,11 @@ class WashUpgrade(_PluginBase):
         for kw in [k.strip() for k in self._exclude_keywords.split(",") if k.strip()]:
             if self._norm_title(kw) in tu:
                 return False
-        # 最低分辨率门槛
+        # 最低分辨率门槛（2160P 等写法通过 _variants 归一，避免误判成最低档）
         if self._min_resolution:
             res_rank = 0
             for tok in _DIMENSIONS[0][1]:
-                tgt = _SYN.get(tok, tok)
-                if tgt in tu:
+                if any(v in tu for v in _variants(tok)):
                     res_rank = max(res_rank, _RES_RANK.get(tok, 0))
             if res_rank < _RES_RANK.get(self._min_resolution, 0):
                 return False
@@ -1321,11 +1323,17 @@ class WashUpgrade(_PluginBase):
     def get_service(self) -> list[dict]:
         if not self.get_state():
             return []
+        # Cron 表达式写错会让整个定时服务注册失败，这里兜底回默认每天 04:00
+        try:
+            trigger = CronTrigger.from_crontab((self._crontab or "").strip() or "0 4 * * *")
+        except Exception as e:  # noqa: BLE001
+            self._record(f"扫描周期「{self._crontab}」无效（{e}），已回退为每天 04:00")
+            trigger = CronTrigger.from_crontab("0 4 * * *")
         return [
             {
-                "id": "WashUpgrade.Score",
+                "id": "scan",
                 "name": "评分洗版扫描",
-                "trigger": CronTrigger.from_crontab(self._crontab),
+                "trigger": trigger,
                 "func": self.wash,
                 "kwargs": {},
             }
@@ -1695,13 +1703,23 @@ class WashUpgrade(_PluginBase):
 
         # ---- 进行评分洗版 ----
         if self._dry_run:
-            self._record(f"《{name}》[试运行] 将进行评分洗版（不实际下载）")
+            self._record(
+                f"《{name}》[试运行] 将进行评分洗版（不实际下载）：{best_title}"
+                f"（评分 {cur_score} → {best_score}）"
+            )
             return
         self._record(f"《{name}》进行评分洗版：开始下载")
         try:
-            DownloadChain().download_single(best_ctx)
+            ret = DownloadChain().download_single(best_ctx)
         except Exception as e:  # noqa: BLE001
             self._record(f"《{name}》下载失败：{e}")
+            return
+        # 宿主在「准备失败 / 被去重 / 未满足提交条件」时返回 None 而不是抛异常，
+        # 不能把这种情况算作洗版成功，否则次数上限会被白白消耗掉。
+        if ret is None:
+            self._record(
+                f"《{name}》下载未成功（宿主返回空，可能已存在相同任务或被站点拒绝），本次不计入洗版"
+            )
             return
         self._best_scores[sid] = best_score
         self._best_titles[sid] = best_title
