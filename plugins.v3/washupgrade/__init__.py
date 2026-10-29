@@ -114,7 +114,7 @@ class WashUpgrade(_PluginBase):
     plugin_name = "洗版自用"
     plugin_desc = "评分洗版：分集也洗、出全集自动转全集（但不降画质）；9 个维度可分别设「洗到哪一档就停」。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.6.3"
+    plugin_version = "1.6.4"
     plugin_author = "15373426383s-wq"
     author_url = "https://github.com/15373426383s-wq"
     plugin_config_prefix = "washupgrade_"
@@ -153,6 +153,7 @@ class WashUpgrade(_PluginBase):
     _notify_enabled = True
     _notify_level = _NOTIFY_SUMMARY
     _run_stats: dict[str, Any] = {}   # 本次运行统计（洗版/完成/跳过），用于发汇总
+    _raw_config: dict[str, Any] = {}  # init_plugin 收到的原始配置（一键修正回写时用）
     _done: dict[str, dict] = {}  # 已完成洗版的订阅（持久化）
     _cursor_sid: int | None = None   # 分批续接点：上次最后一个处理过的订阅 id
     _batch_left = 0             # 上次运行还剩多少个订阅没处理
@@ -173,6 +174,8 @@ class WashUpgrade(_PluginBase):
     # ------------------------------------------------------------------ #
     def init_plugin(self, config: dict | None = None) -> None:
         config = config or {}
+        # 留一份原始配置，供「一键修正」这类操作回写时不全量丢配置
+        self._raw_config = dict(config)
         self._enabled = bool(config.get("enabled"))
         self._scope = str(config.get("scope") or _SCOPE_ALL)
         self._only_best_version = bool(config.get("only_best_version", True))
@@ -467,6 +470,24 @@ class WashUpgrade(_PluginBase):
         self._done[key] = st
         self._save_done()
         return reason
+
+    def fix_batch(self) -> dict[str, Any]:
+        """把「单次运行最多处理订阅数」改成 0（一次跑完全部订阅）并保存配置。"""
+        cfg = dict(getattr(self, "_raw_config", None) or {})
+        if not cfg:
+            return {
+                "success": False,
+                "message": "没读到当前配置，请到配置页把「单次运行最多处理订阅数」手动改成 0。",
+            }
+        cfg["batch_limit"] = 0
+        try:
+            self.update_config(cfg)
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "message": f"保存配置失败：{e}"}
+        self._batch_limit = 0
+        self._raw_config = cfg
+        self._record("已把「单次运行最多处理订阅数」设为 0（一次跑完全部订阅）")
+        return {"success": True, "message": "已设为一次跑完全部订阅，下次运行生效。"}
 
     def reset_done(self) -> dict[str, Any]:
         """清空「已完成洗版」记录，让所有订阅重新参与洗版。"""
@@ -1120,16 +1141,20 @@ class WashUpgrade(_PluginBase):
                 f"上一轮还没跑完下次又到点（重叠的触发会被跳过）。"
                 f"建议调小「每个订阅之间的间隔」，或把周期改成一天 1 轮。"
             )
-        if self._batch_limit and len(pending) > self._batch_limit:
+        batch_starved = bool(self._batch_limit and len(pending) > self._batch_limit)
+        if batch_starved:
             warns.append(
-                f"还有 {len(pending) - self._batch_limit} 个订阅本次不会处理；"
-                f"把「单次运行最多处理订阅数」设为 0 可以一次跑完。"
+                f"当前只处理 {self._batch_limit} 个，还有 "
+                f"{len(pending) - self._batch_limit} 个订阅本次不会处理。"
+                f"点下面的按钮可改成一次跑完。"
             )
         for w in warns[:3]:
             nodes.append({
                 "component": "VAlert",
                 "props": {"type": "warning", "variant": "tonal", "class": "mb-2", "text": w},
             })
+        if batch_starved:
+            nodes.append(self._fix_batch_card())
 
         if err:
             nodes.append({
@@ -1207,6 +1232,33 @@ class WashUpgrade(_PluginBase):
                     "events": {
                         "click": {
                             "api": f"plugin/{self.__class__.__name__}/run",
+                            "method": "POST",
+                            "params": {},
+                        }
+                    },
+                }
+            ],
+        }
+
+    def _fix_batch_card(self) -> dict:
+        """一键把「单次运行最多处理订阅数」改成 0。"""
+        return {
+            "component": "VCard",
+            "props": {"variant": "tonal", "color": "surface-variant", "class": "mb-3 pa-1"},
+            "content": [
+                {
+                    "component": "VBtn",
+                    "props": {
+                        "color": "primary",
+                        "variant": "flat",
+                        "block": True,
+                        "size": "small",
+                        "prepend-icon": "mdi-playlist-check",
+                        "text": "改成一次跑完全部订阅（设为 0）",
+                    },
+                    "events": {
+                        "click": {
+                            "api": f"plugin/{self.__class__.__name__}/fix_batch",
                             "method": "POST",
                             "params": {},
                         }
@@ -1372,6 +1424,13 @@ class WashUpgrade(_PluginBase):
                 "summary": "重置洗版完成状态",
                 "allow_anonymous": True,
             },
+            {
+                "path": "/fix_batch",
+                "endpoint": self.fix_batch,
+                "methods": ["POST"],
+                "summary": "设为一次跑完全部订阅",
+                "allow_anonymous": True,
+            },
         ]
 
     def get_command(self) -> list[dict[str, Any]]:
@@ -1485,6 +1544,7 @@ class WashUpgrade(_PluginBase):
         if done_skipped:
             st["skipped"] = done_skipped
             self._record(f"已完成洗版：{done_skipped} 个订阅已到顶，本轮跳过（不访问站点）")
+        self._record(f"订阅总数 {len(subs)} 个，本轮待洗 {len(targets)} 个")
 
         if not targets:
             self._last_run = "本次无可洗版订阅"
@@ -1529,6 +1589,8 @@ class WashUpgrade(_PluginBase):
         self._last_run = f"{mode_text}洗版完成，处理 {total} 个订阅"
         if left:
             self._last_run += f"，还剩 {left} 个未处理（再点一次「立即洗版一次」会接着洗）"
+        else:
+            self._last_run += "（本轮已覆盖全部待洗订阅）"
         self._record(self._last_run)
         self._stats()["processed"] = total
         self._notice_summary()
