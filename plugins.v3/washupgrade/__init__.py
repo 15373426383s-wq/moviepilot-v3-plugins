@@ -30,6 +30,11 @@ _TV_AUTO = "auto"          # 分集也洗；一旦出现全集/整季包，自�
 _TV_PACK_ONLY = "pack_only"  # 只等全集/整季包，分集一律不洗
 _TV_EPISODE = "episode"    # 只按分集洗，不区分全集（等同旧行为）
 
+# 通知内容（走 MoviePilot 的通知渠道，Telegram / 微信 / Bark 等都行）
+_NOTIFY_SUMMARY = "summary"   # 每次运行结束发一条汇总（默认）
+_NOTIFY_EVENT = "event"       # 每洗一次发一条明细
+_NOTIFY_DONE = "done"         # 只在洗版完成时发一条
+
 # 9 维评分维度（顺序 = 优先级 #1 → #9，与 MP「洗版评分规则」页一致）
 _DIMENSIONS = [
     ("resolution", ["8K", "4K", "1080P", "1080I", "720P", "SD"]),
@@ -109,7 +114,7 @@ class WashUpgrade(_PluginBase):
     plugin_name = "洗版自用"
     plugin_desc = "评分洗版：分集也洗、出全集自动转全集（但不降画质）；9 个维度可分别设「洗到哪一档就停」。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.5.1"
+    plugin_version = "1.6.0"
     plugin_author = "your-name"
     author_url = "https://github.com/your-name"
     plugin_config_prefix = "washupgrade_"
@@ -144,6 +149,10 @@ class WashUpgrade(_PluginBase):
     _stop_on_complete_pack = True   # 电视剧洗到全集即视为完成
     _give_up_rounds = 3         # 连续这么多轮没找到更优版本就收工（0 = 不放弃）
     _hide_done = True           # 已完成的订阅从详情页移除
+    # 通知（通过 MoviePilot 已配置的通知渠道发送，Telegram 等）
+    _notify_enabled = True
+    _notify_level = _NOTIFY_SUMMARY
+    _run_stats: dict[str, Any] = {}   # 本次运行统计（洗版/完成/跳过），用于发汇总
     _done: dict[str, dict] = {}  # 已完成洗版的订阅（持久化）
     _cursor = 0                 # 分批轮转起点
     _last_wash_at: dict[int, float] = {}   # 订阅 id -> 上次洗版时间戳
@@ -219,6 +228,10 @@ class WashUpgrade(_PluginBase):
         self._stop_on_complete_pack = bool(config.get("stop_on_complete_pack", True))
         self._give_up_rounds = self._to_int(config.get("give_up_rounds"), 3, 0, 100)
         self._hide_done = bool(config.get("hide_done", True))
+        # 通知
+        self._notify_enabled = bool(config.get("notify_enabled", True))
+        lv = str(config.get("notify_level") or _NOTIFY_SUMMARY)
+        self._notify_level = lv if lv in (_NOTIFY_SUMMARY, _NOTIFY_EVENT, _NOTIFY_DONE) else _NOTIFY_SUMMARY
         # 冷却记录/轮转游标/版本缓存/完成状态：跨配置重载保留，但每个实例独立一份
         if "_last_wash_at" not in self.__dict__:
             self._last_wash_at = {}
@@ -230,6 +243,8 @@ class WashUpgrade(_PluginBase):
             self._best_scores = {}
         if "_best_titles" not in self.__dict__:
             self._best_titles = {}
+        if "_run_stats" not in self.__dict__:
+            self._run_stats = self._empty_stats()
         self._load_done()
         self._record("插件已加载 / 重新配置")
         # 「立即运行一次」开关：保存配置时若为开，则触发一次并自动复位为关，避免重启重复执行
@@ -455,6 +470,11 @@ class WashUpgrade(_PluginBase):
         self._record(f"已重置洗版完成状态，{n} 个订阅重新参与洗版")
         return {"success": True, "message": f"已重置 {n} 个订阅的完成状态。"}
 
+    def _mark_run_done(self, name: str, reason: str) -> None:
+        """记录「本订阅洗到顶」并（按通知级别）发完成通知。"""
+        self._stats()["done"].append({"name": name, "reason": reason})
+        self._notice_done(name, reason)
+
     def _set_done(self, sub: Any, reason: str, title: str = "") -> None:
         """直接标记完成（不增加洗版次数），用于「已达目标画质」这类收工判定。"""
         key = self._done_key(sub)
@@ -495,6 +515,103 @@ class WashUpgrade(_PluginBase):
         self._done[key] = st
         self._save_done()
         return ""
+
+    # ------------------------------------------------------------------ #
+    # 通知：走 MoviePilot 已配置的通知渠道（Telegram / 微信 / Bark …）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _empty_stats() -> dict[str, Any]:
+        return {"total": 0, "processed": 0, "washed": [], "done": [], "skipped": 0}
+
+    def _stats(self) -> dict[str, Any]:
+        st = self.__dict__.get("_run_stats")
+        if not isinstance(st, dict) or "washed" not in st:
+            st = self._empty_stats()
+            self._run_stats = st
+        return st
+
+    @staticmethod
+    def _short(title: str, limit: int = 60) -> str:
+        """通知里把长标题截断，避免一条消息刷屏。"""
+        t = str(title or "")
+        return t if len(t) <= limit else t[: limit - 1] + "…"
+
+    def _send_notice(self, title: str, text: str) -> bool:
+        """发一条通知。用 MP 自己的通知链，所以 TG/微信等渠道只要在 MP 里配好就会收到。"""
+        if not self._notify_enabled:
+            return False
+        try:
+            from app.chain.message import MessageChain
+            from app.schemas.message import Message
+            from app.schemas.types import MessageType
+
+            MessageChain().post_message(
+                Message(mtype=MessageType.Plugin, title=title, text=text)
+            )
+            self._record(f"已发送通知：{title}")
+            return True
+        except Exception as e:  # noqa: BLE001
+            # 通知失败绝不影响洗版主流程
+            self._record(f"发送通知失败（不影响洗版）：{e}")
+            return False
+
+    def _notice_wash(
+        self,
+        name: str,
+        old_title: str,
+        new_title: str,
+        old_score: int,
+        new_score: int,
+        is_pack: bool = False,
+    ) -> None:
+        """「每次洗版发一条」模式下的明细通知。"""
+        if self._notify_level != _NOTIFY_EVENT:
+            return
+        kind = "全集" if is_pack else "分集"
+        lines = [
+            f"《{name}》已洗版（{kind}）",
+            f"旧：{self._short(old_title) or '未记录'}",
+            f"新：{self._short(new_title)}",
+            f"评分：{old_score if old_score >= 0 else '未知'} → {new_score}",
+        ]
+        self._send_notice(f"洗版：{name}", "\n".join(lines))
+
+    def _notice_done(self, name: str, reason: str) -> None:
+        """订阅洗到封顶时的通知。"""
+        if self._notify_level not in (_NOTIFY_EVENT, _NOTIFY_DONE):
+            return
+        self._send_notice(
+            f"洗版完成：{name}",
+            f"《{name}》{reason}\n后续不再检测，已从首页移除；想重洗可在插件详情页点「重置完成状态」。",
+        )
+
+    def _notice_summary(self) -> None:
+        """一次运行结束后的汇总通知（默认模式）。什么都没发生就不发，免得天天骚扰。"""
+        if self._notify_level != _NOTIFY_SUMMARY:
+            return
+        st = self._stats()
+        washed = st.get("washed") or []
+        done = st.get("done") or []
+        if not washed and not done:
+            return
+        lines = [
+            f"处理 {st.get('processed', 0)} 个订阅，"
+            f"洗版 {len(washed)} 个，完成 {len(done)} 个"
+        ]
+        for it in washed[:8]:
+            kind = "（全集）" if it.get("is_pack") else ""
+            t = str(it.get("title", "") or "")
+            if t.startswith("已触发原生"):
+                lines.append(f"· {it.get('name', '')}（原生最佳版本搜索）")
+            else:
+                lines.append(f"· {it.get('name', '')} → {self._short(t, 48)}{kind}")
+        if len(washed) > 8:
+            lines.append(f"· …另有 {len(washed) - 8} 个")
+        if done:
+            names = "、".join(str(d.get("name", "")) for d in done[:6])
+            more = f" 等 {len(done)} 个" if len(done) > 6 else ""
+            lines.append(f"已洗到顶：{names}{more}")
+        self._send_notice("洗版报告", "\n".join(lines))
 
     @classmethod
     def _score_title(
@@ -832,6 +949,36 @@ class WashUpgrade(_PluginBase):
                             "placeholder": "0",
                         },
                     },
+                    # ===== 分区：通知 =====
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "text": "通知：走 MoviePilot 自己的通知渠道，只要在「设置 → 消息通知」里"
+                                    "配好 Telegram 机器人（或微信/Bark 等），这里开着就会收到洗版消息。"
+                                    "试运行不发送通知。",
+                        },
+                    },
+                    {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "notify_enabled",
+                            "label": "洗版后发送通知（Telegram 等）",
+                        },
+                    },
+                    {
+                        "component": "VSelect",
+                        "props": {
+                            "model": "notify_level",
+                            "label": "通知内容",
+                            "items": [
+                                {"title": "每次运行结束发一条汇总（推荐）", "value": _NOTIFY_SUMMARY},
+                                {"title": "每洗一次发一条明细（含新旧版本号）", "value": _NOTIFY_EVENT},
+                                {"title": "只在洗到顶/完成时发一条", "value": _NOTIFY_DONE},
+                            ],
+                        },
+                    },
                 ]
         # 加大行与行的间距（Vuetify 间距类，MP 表单会把 props 透传给组件）
         for _it in content:
@@ -860,6 +1007,8 @@ class WashUpgrade(_PluginBase):
             "stop_on_complete_pack": True,
             "give_up_rounds": 3,
             "hide_done": True,
+            "notify_enabled": True,
+            "notify_level": _NOTIFY_SUMMARY,
             **{f"{dim}_enabled": True for dim, _v in _DIMENSIONS},
             **{f"{dim}_values": list(vals) for dim, vals in _DIMENSIONS},
             "min_resolution": "",
@@ -1203,6 +1352,7 @@ class WashUpgrade(_PluginBase):
         mode_text = "原生最佳版本" if self._wash_mode == _MODE_NATIVE else "自定义类别打分"
         scope_text = {"all": "全部", "movie": "电影", "tv": "电视剧"}.get(self._scope, "全部")
         self._record(f"开始扫描（模式：{mode_text}，范围：{scope_text}，试运行：{self._dry_run}）")
+        self._run_stats = self._empty_stats()
         try:
             subs = SubscribeOper().list()
         except Exception as e:  # noqa: BLE001
@@ -1237,7 +1387,10 @@ class WashUpgrade(_PluginBase):
                 continue
             targets.append((sid, sub))
 
+        st = self._stats()
+        st["total"] = len(subs)
         if done_skipped:
+            st["skipped"] = done_skipped
             self._record(f"已完成洗版：{done_skipped} 个订阅已到顶，本轮跳过（不访问站点）")
 
         if not targets:
@@ -1281,6 +1434,8 @@ class WashUpgrade(_PluginBase):
 
         self._last_run = f"{mode_text}洗版完成，处理 {total} 个订阅"
         self._record(self._last_run)
+        self._stats()["processed"] = total
+        self._notice_summary()
 
     # ------------------------------------------------------------------ #
     # 请求频率控制
@@ -1349,6 +1504,7 @@ class WashUpgrade(_PluginBase):
                 f"《{name}》已达封顶档位（{self._ceiling_text()}），跳过触发，"
                 f"后续不再检测，已从首页移除"
             )
+            self._mark_run_done(name, f"当前版本已达封顶档位（{self._ceiling_text()}）")
             return
         try:
             SubscribeChain().search(sids=(sid,), manual=True)
@@ -1356,9 +1512,13 @@ class WashUpgrade(_PluginBase):
         except Exception as e:  # noqa: BLE001
             self._record(f"《{name}》原生搜索失败：{e}")
             return
+        self._stats()["washed"].append({"name": name, "title": "已触发原生最佳版本搜索", "is_pack": False})
+        if self._notify_level == _NOTIFY_EVENT:
+            self._send_notice(f"洗版：{name}", f"《{name}》已触发 MoviePilot 原生最佳版本搜索")
         reason = self._mark_wash(sub, cur, is_pack=False)
         if reason:
             self._record(f"《{name}》洗版完成 → {reason}，后续不再检测，已从首页移除")
+            self._mark_run_done(name, reason)
 
     # ------------------------------------------------------------------ #
     # 自定义权重模式：搜索 + 打分 + 下载更优版本
@@ -1473,6 +1633,7 @@ class WashUpgrade(_PluginBase):
             miss_reason = self._count_miss(sub, cur_title, assume_pack=cur_is_pack)
             if miss_reason:
                 self._record(f"《{name}》洗版结束 → {miss_reason}，后续不再检测")
+                self._mark_run_done(name, miss_reason)
             return
 
         best_is_pack = bool(is_tv and self._is_complete_pack(best_title, total_ep))
@@ -1483,6 +1644,7 @@ class WashUpgrade(_PluginBase):
             miss_reason = self._count_miss(sub, cur_title, assume_pack=True)
             if miss_reason:
                 self._record(f"《{name}》洗版结束 → {miss_reason}，后续不再检测")
+                self._mark_run_done(name, miss_reason)
             return
 
         if best_is_pack and not cur_is_pack:
@@ -1496,6 +1658,7 @@ class WashUpgrade(_PluginBase):
                 miss_reason = self._count_miss(sub, cur_title, assume_pack=True)
                 if miss_reason:
                     self._record(f"《{name}》洗版结束 → {miss_reason}，后续不再检测")
+                    self._mark_run_done(name, miss_reason)
                 return
             self._record(
                 f"《{name}》出现全集资源：{best_title}（评分 {best_score}）→ 自动转全集洗版"
@@ -1522,10 +1685,12 @@ class WashUpgrade(_PluginBase):
                     f"《{name}》洗版结束 → 已达封顶档位（{self._ceiling_text()}），"
                     f"后续不再检测，已从首页移除"
                 )
+                self._mark_run_done(name, f"当前版本已达封顶档位（{self._ceiling_text()}）")
                 return
             miss_reason = self._count_miss(sub, cur_title, assume_pack=cur_is_pack)
             if miss_reason:
                 self._record(f"《{name}》洗版结束 → {miss_reason}，后续不再检测")
+                self._mark_run_done(name, miss_reason)
             return
 
         # ---- 进行评分洗版 ----
@@ -1541,9 +1706,14 @@ class WashUpgrade(_PluginBase):
         self._best_scores[sid] = best_score
         self._best_titles[sid] = best_title
         self._record(f"《{name}》评分洗版已提交下载（评分 {best_score}）")
+        self._stats()["washed"].append(
+            {"name": name, "title": best_title, "is_pack": best_is_pack}
+        )
+        self._notice_wash(name, cur_title, best_title, cur_score, best_score, best_is_pack)
         reason = self._mark_wash(sub, best_title, is_pack=best_is_pack)
         if reason:
             self._record(f"《{name}》洗版完成 → {reason}，后续不再检测，已从首页移除")
+            self._mark_run_done(name, reason)
 
     # ------------------------------------------------------------------ #
     # 停用：释放后台资源
