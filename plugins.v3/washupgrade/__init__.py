@@ -114,7 +114,7 @@ class WashUpgrade(_PluginBase):
     plugin_name = "洗版自用"
     plugin_desc = "评分洗版：分集也洗、出全集自动转全集（但不降画质）；9 个维度可分别设「洗到哪一档就停」。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.6.4"
+    plugin_version = "1.6.5"
     plugin_author = "15373426383s-wq"
     author_url = "https://github.com/15373426383s-wq"
     plugin_config_prefix = "washupgrade_"
@@ -168,6 +168,8 @@ class WashUpgrade(_PluginBase):
     _best_titles: dict[int, str] = {}
     # 防止手动/定时并发重叠执行
     _running = False
+    # 宿主停用插件时置真，正在跑的循环会在当前订阅结束后退出
+    _stopped = False
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -251,7 +253,9 @@ class WashUpgrade(_PluginBase):
             self._best_titles = {}
         if "_run_stats" not in self.__dict__:
             self._run_stats = self._empty_stats()
-        self._load_done()
+        # 每次重新配置都视为「重新启用」，清掉上次停用的中断标记
+        self._stopped = False
+        self._load_state()
         self._record("插件已加载 / 重新配置")
         # 「立即运行一次」开关：保存配置时若为开，则触发一次并自动复位为关，避免重启重复执行
         self._run_once = bool(config.get("run_once"))
@@ -264,7 +268,8 @@ class WashUpgrade(_PluginBase):
             except Exception as e:  # noqa: BLE001
                 self._record(f"复位「立即运行一次」失败：{e}")
             if self._enabled:
-                self._trigger_background("立即运行一次")
+                # 延迟几秒再跑：宿主的插件加载/配置写入可能刚发生，DB 与各链未必就绪
+                self._trigger_background("立即运行一次", delay=8)
 
     def get_state(self) -> bool:
         return self._enabled
@@ -390,21 +395,82 @@ class WashUpgrade(_PluginBase):
                 return a < b        # 下标越小画质越好
         return True
 
-    def _load_done(self) -> None:
-        """载入「已完成洗版」记录（持久化在插件数据里）。"""
+    def _safe_get_data(self, key: str) -> Any:
+        """读插件数据；读失败按空处理并记一行日志，不让启动流程崩掉。"""
+        try:
+            return self.get_data(key)
+        except Exception as e:  # noqa: BLE001
+            self._record(f"读取插件数据「{key}」失败（按空处理）：{e}")
+            return None
+
+    def _load_state(self) -> None:
+        """载入持久化状态：已完成记录 + 冷却时间 + 分批续接点 + 基线标题。
+
+        MoviePilot 把插件数据存在数据库表 plugindata（事务内原子写入），
+        所以这里不需要自己做临时文件 + 重命名那套；读取侧做类型容错即可。
+        """
         if "_done" not in self.__dict__:
-            data = None
-            try:
-                data = self.get_data("done")
-            except Exception:  # noqa: BLE001
-                data = None
+            data = self._safe_get_data("done")
+            if data is not None and not isinstance(data, dict):
+                self._record("已完成的洗版记录格式异常，已按空处理")
             self._done = data if isinstance(data, dict) else {}
 
-    def _save_done(self) -> None:
+        if "_runtime_loaded" in self.__dict__:
+            return
+        self._runtime_loaded = True
+        rt = self._safe_get_data("runtime")
+        if not isinstance(rt, dict):
+            return
+        # 冷却时间（key 在 JSON 里会变成字符串，读回来要转 int）
+        cooldown = rt.get("cooldown")
+        if isinstance(cooldown, dict):
+            for k, v in cooldown.items():
+                try:
+                    self._last_wash_at[int(k)] = float(v)
+                except (TypeError, ValueError):
+                    continue
+        # 分批续接点
+        cur = rt.get("cursor_sid")
+        if isinstance(cur, int):
+            self._cursor_sid = cur
+        self._batch_left = self._to_int(rt.get("batch_left"), 0, 0, 10 ** 6)
+        # 基线标题（下载历史取不到时的兜底）
+        best = rt.get("best")
+        if isinstance(best, dict):
+            for k, v in best.items():
+                try:
+                    self._best_titles[int(k)] = str(v)
+                except (TypeError, ValueError):
+                    continue
+
+    def _save_state(self) -> None:
+        """把「完成记录 + 冷却 + 续接点 + 基线」一次性写回插件数据。
+
+        只写一个 key，避免多次写库；单次写失败只记日志，不影响洗版主流程。
+        """
+        # 冷却只保留 7 天内的，避免长期运行后无限膨胀
+        cutoff = time.time() - 7 * 86400
+        cooldown = {
+            str(k): float(v) for k, v in (self._last_wash_at or {}).items() if v >= cutoff
+        }
+        runtime = {
+            "cooldown": cooldown,
+            "cursor_sid": self.__dict__.get("_cursor_sid"),
+            "batch_left": self._to_int(self.__dict__.get("_batch_left"), 0, 0, 10 ** 6),
+            "best": {str(k): v for k, v in (self._best_titles or {}).items() if v},
+        }
         try:
             self.save_data("done", self._done)
         except Exception as e:  # noqa: BLE001
             self._record(f"保存洗版完成状态失败：{e}")
+        try:
+            self.save_data("runtime", runtime)
+        except Exception as e:  # noqa: BLE001
+            self._record(f"保存运行状态失败：{e}")
+
+    # 兼容旧调用点：语义上就是把状态整体落盘
+    def _save_done(self) -> None:
+        self._save_state()
 
     @staticmethod
     def _done_key(sub: Any) -> str:
@@ -1436,14 +1502,23 @@ class WashUpgrade(_PluginBase):
     def get_command(self) -> list[dict[str, Any]]:
         return []
 
-    def _trigger_background(self, reason: str) -> bool:
-        """后台线程执行一次洗版，避免阻塞前端或配置保存。返回是否真正触发。"""
+    def _trigger_background(self, reason: str, delay: float = 0) -> bool:
+        """后台线程执行一次洗版，避免阻塞前端或配置保存。返回是否真正触发。
+
+        delay > 0 时先等待再执行，用于「保存配置后立刻运行」——
+        避免宿主刚写完配置、插件刚加载时就开跑。
+        """
         if self._running or not self.get_state():
             return False
         self._running = True
 
         def _worker() -> None:
             try:
+                if delay > 0:
+                    time.sleep(delay)
+                # 等待期间可能被停用/卸载，或已被别的实例接管，这里再确认一次
+                if self.__dict__.get("_stopped") or not self.get_state():
+                    return
                 self._record(f"手动触发：{reason}")
                 self.wash()
             finally:
@@ -1577,6 +1652,12 @@ class WashUpgrade(_PluginBase):
             )
 
         for i, (sid, sub) in enumerate(targets):
+            # 插件在运行途中被停用/卸载时，处理完当前订阅就退出，不硬杀线程
+            if self.__dict__.get("_stopped"):
+                self._last_run = f"插件已停用，本轮提前结束（已处理 {i}/{total} 个）"
+                self._record(self._last_run)
+                self._save_state()
+                return
             if self._wash_mode == _MODE_NATIVE:
                 self._native_wash_one(sid, sub)
             else:
@@ -1593,6 +1674,8 @@ class WashUpgrade(_PluginBase):
             self._last_run += "（本轮已覆盖全部待洗订阅）"
         self._record(self._last_run)
         self._stats()["processed"] = total
+        # 本轮更新的冷却时间 / 分批续接点 / 基线标题统一落盘，重启不丢
+        self._save_state()
         self._notice_summary()
 
     # ------------------------------------------------------------------ #
@@ -1899,4 +1982,14 @@ class WashUpgrade(_PluginBase):
     # 停用：释放后台资源
     # ------------------------------------------------------------------ #
     def stop_service(self) -> None:
+        """插件被停用/卸载时由宿主调用。
+
+        只置标志，不强行杀线程：正在跑的循环会在当前订阅处理完后自行退出，
+        避免把「已提交下载」的动作割断在半途。
+        """
         self._enabled = False
+        self._stopped = True
+        try:
+            self._record("插件已停用：正在执行的任务会在当前订阅处理完后退出")
+        except Exception:  # noqa: BLE001
+            pass
