@@ -1,7 +1,7 @@
 import random
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from threading import Thread
 from typing import Any
 from urllib.parse import quote
@@ -114,7 +114,7 @@ class WashUpgrade(_PluginBase):
     plugin_name = "洗版自用"
     plugin_desc = "评分洗版：分集也洗、出全集自动转全集（但不降画质）；9 个维度可分别设「洗到哪一档就停」。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.6.2"
+    plugin_version = "1.6.3"
     plugin_author = "15373426383s-wq"
     author_url = "https://github.com/15373426383s-wq"
     plugin_config_prefix = "washupgrade_"
@@ -1025,6 +1025,27 @@ class WashUpgrade(_PluginBase):
     # ------------------------------------------------------------------ #
     # 详情页（数据 + 手动触发）
     # ------------------------------------------------------------------ #
+    def _cron_summary(self) -> tuple[str, int]:
+        """返回 (cron 表达式, 未来 24 小时的触发次数)。解析失败时次数为 0。"""
+        expr = (self._crontab or "").strip()
+        if not expr:
+            return "", 0
+        try:
+            trig = CronTrigger.from_crontab(expr)
+            tz = getattr(trig, "timezone", None)
+            now = datetime.now(tz) if tz else datetime.now()
+            count = 0
+            cursor = now
+            for _ in range(100):
+                nxt = trig.get_next_fire_time(None, cursor)
+                if nxt is None or (nxt - now).total_seconds() > 86400:
+                    break
+                count += 1
+                cursor = nxt + timedelta(seconds=1)
+            return expr, count
+        except Exception:  # noqa: BLE001
+            return expr, 0
+
     def get_page(self) -> list[dict]:
         """详情页：海报 + 当前版本的一览式卡片，尽量少文字。"""
         mode_text = "原生最佳版本" if self._wash_mode == _MODE_NATIVE else "自定义类别打分"
@@ -1040,36 +1061,82 @@ class WashUpgrade(_PluginBase):
                             "处理完之前请勿重复点按钮，否则会被忽略。",
                 },
             })
-        nodes.append({
-            "component": "VCardText",
-            "props": {"class": "pa-0 px-1 pb-3 text-caption text-medium-emphasis"},
-            "text": (
-                f"{'运行中' if self._enabled else '已停用'} · {mode_text} · "
-                f"{'试运行' if self._dry_run else '正式'} · 间隔 {self._interval_seconds}s · "
-                f"单次 {(str(self._batch_limit) + ' 个') if self._batch_limit else '全部'} · 冷却 {self._cooldown_hours}h · "
-                f"洗到 {self._ceiling_text()} 停 · 最多洗 {self._max_wash_times or '不限'} 次"
-            ),
-        })
 
+        # 先读订阅，才能算出「待洗几个 / 一轮要跑多久」
         subs: list[Any] = []
         err = ""
         try:
             subs = list(SubscribeOper().list() or [])
         except Exception as e:  # noqa: BLE001
             err = str(e)
+        pending: list[Any] = []
+        finished: list[Any] = []
+        if not err:
+            for s in subs:
+                if not getattr(s, "name", None):
+                    continue
+                reason = self._done_reason(s, self._current_version_cached(s))
+                (finished if reason else pending).append(s)
+
+        # 周期 / 每轮规模 / 预计耗时，直接摆出来，省得靠猜
+        expr, cycles = self._cron_summary()
+        per_run = min(len(pending), self._batch_limit) if self._batch_limit else len(pending)
+        est_min = round(per_run * max(0, self._interval_seconds) / 60)
+        cycle_text = f"{expr}（每天约 {cycles} 次）" if expr and cycles else (expr or "未设置")
+        parts = [
+            "运行中" if self._enabled else "已停用",
+            mode_text,
+            "试运行" if self._dry_run else "正式",
+            f"周期 {cycle_text}",
+            f"间隔 {self._interval_seconds}s",
+            f"单次 {'全部' if not self._batch_limit else str(self._batch_limit) + ' 个'}",
+            f"冷却 {self._cooldown_hours}h",
+            f"洗到 {self._ceiling_text()} 停",
+            f"最多洗 {self._max_wash_times or '不限'} 次",
+        ]
+        if pending:
+            parts.append(f"预计单轮 ~{est_min} 分钟")
+        nodes.append({
+            "component": "VCardText",
+            "props": {"class": "pa-0 px-1 pb-2 text-caption text-medium-emphasis"},
+            "text": " · ".join(parts),
+        })
+
+        # 配置健康检查：跑不完 / 冷却吃掉多轮 / 一批洗不完，直接说出来
+        warns: list[str] = []
+        if not self._enabled:
+            warns.append("插件未启用：定时任务不会注册，只能手动点按钮。")
+        cycle_sec = (86400 / cycles) if cycles else 0
+        if cycles >= 2 and self._cooldown_hours * 3600 >= cycle_sec:
+            keep_h = max(1, int(cycle_sec / 3600 / 2))
+            warns.append(
+                f"冷却 {self._cooldown_hours} 小时 ≥ 周期间隔 {cycle_sec / 3600:.0f} 小时："
+                f"每天 {cycles} 轮里多出来的轮次会被全部跳过，等于白跑。"
+                f"想真的一天洗 {cycles} 轮，把冷却调到 {keep_h} 小时左右。"
+            )
+        if cycle_sec and pending and est_min * 60 > cycle_sec:
+            warns.append(
+                f"单轮预计 {est_min} 分钟，超过周期间隔 {int(cycle_sec / 60)} 分钟："
+                f"上一轮还没跑完下次又到点（重叠的触发会被跳过）。"
+                f"建议调小「每个订阅之间的间隔」，或把周期改成一天 1 轮。"
+            )
+        if self._batch_limit and len(pending) > self._batch_limit:
+            warns.append(
+                f"还有 {len(pending) - self._batch_limit} 个订阅本次不会处理；"
+                f"把「单次运行最多处理订阅数」设为 0 可以一次跑完。"
+            )
+        for w in warns[:3]:
+            nodes.append({
+                "component": "VAlert",
+                "props": {"type": "warning", "variant": "tonal", "class": "mb-2", "text": w},
+            })
+
         if err:
             nodes.append({
                 "component": "VAlert",
                 "props": {"type": "warning", "variant": "tonal", "text": f"读取订阅失败：{err}"},
             })
         else:
-            pending: list[Any] = []
-            finished: list[Any] = []
-            for s in subs:
-                if not getattr(s, "name", None):
-                    continue
-                reason = self._done_reason(s, self._current_version_cached(s))
-                (finished if reason else pending).append(s)
             shown = pending if self._hide_done else (pending + finished)
             cards = [self._sub_card(s) for s in shown[:30]]
             if cards:
