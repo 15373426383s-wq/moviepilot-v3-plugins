@@ -114,7 +114,7 @@ class WashUpgrade(_PluginBase):
     plugin_name = "洗版自用"
     plugin_desc = "评分洗版：分集也洗、出全集自动转全集（但不降画质）；9 个维度可分别设「洗到哪一档就停」。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.6.1"
+    plugin_version = "1.6.2"
     plugin_author = "15373426383s-wq"
     author_url = "https://github.com/15373426383s-wq"
     plugin_config_prefix = "washupgrade_"
@@ -138,7 +138,7 @@ class WashUpgrade(_PluginBase):
     _score_threshold = 0
     # 请求频率控制（防止站点因访问过于密集而封禁）
     _interval_seconds = 60      # 每处理完一个订阅后等待的秒数（含随机抖动）
-    _batch_limit = 10           # 每轮最多处理多少个订阅（0 = 不限），其余下轮轮转
+    _batch_limit = 0            # 单次运行最多处理多少个订阅（0 = 全部处理，推荐）
     _cooldown_hours = 12        # 同一订阅的冷却小时数，冷却内跳过（0 = 不限）
     _tv_mode = _TV_AUTO         # 电视剧：分集也洗，出全集后自动转全集
     # 洗版封顶：达到这些条件后该订阅不再检测、不再洗版
@@ -154,7 +154,8 @@ class WashUpgrade(_PluginBase):
     _notify_level = _NOTIFY_SUMMARY
     _run_stats: dict[str, Any] = {}   # 本次运行统计（洗版/完成/跳过），用于发汇总
     _done: dict[str, dict] = {}  # 已完成洗版的订阅（持久化）
-    _cursor = 0                 # 分批轮转起点
+    _cursor_sid: int | None = None   # 分批续接点：上次最后一个处理过的订阅 id
+    _batch_left = 0             # 上次运行还剩多少个订阅没处理
     _last_wash_at: dict[int, float] = {}   # 订阅 id -> 上次洗版时间戳
     _ver_cache: dict[int, tuple[str, float]] = {}   # 订阅 id -> (当前版本标题, 缓存时间)
     _last_run = "尚未运行"
@@ -195,7 +196,7 @@ class WashUpgrade(_PluginBase):
             self._score_threshold = 0
         # 请求频率控制
         self._interval_seconds = self._to_int(config.get("interval_seconds"), 60, 0, 3600)
-        self._batch_limit = self._to_int(config.get("batch_limit"), 10, 0, 500)
+        self._batch_limit = self._to_int(config.get("batch_limit"), 0, 0, 500)
         self._cooldown_hours = self._to_int(config.get("cooldown_hours"), 12, 0, 720)
         # 电视剧分集/全集策略（兼容旧配置里的 full_season_only 布尔开关）
         raw_tv_mode = config.get("tv_mode")
@@ -235,8 +236,10 @@ class WashUpgrade(_PluginBase):
         # 冷却记录/轮转游标/版本缓存/完成状态：跨配置重载保留，但每个实例独立一份
         if "_last_wash_at" not in self.__dict__:
             self._last_wash_at = {}
-        if "_cursor" not in self.__dict__:
-            self._cursor = 0
+        if "_cursor_sid" not in self.__dict__:
+            self._cursor_sid = None
+        if "_batch_left" not in self.__dict__:
+            self._batch_left = 0
         if "_ver_cache" not in self.__dict__:
             self._ver_cache = {}
         if "_best_scores" not in self.__dict__:
@@ -830,9 +833,9 @@ class WashUpgrade(_PluginBase):
                         "component": "VTextField",
                         "props": {
                             "model": "batch_limit",
-                            "label": "每轮最多处理订阅数（分批轮转，0 = 不限）",
+                            "label": "单次运行最多处理订阅数（0 = 全部处理，推荐）",
                             "type": "number",
-                            "placeholder": "10",
+                            "placeholder": "0",
                         },
                     },
                     {
@@ -1002,7 +1005,7 @@ class WashUpgrade(_PluginBase):
             "dry_run": True,
             "run_once": False,
             "interval_seconds": 60,
-            "batch_limit": 10,
+            "batch_limit": 0,
             "cooldown_hours": 12,
             "max_wash_times": 2,
             **{f"ceiling_{dim}": ("4K" if dim == "resolution" else "") for dim, _v in _DIMENSIONS},
@@ -1026,13 +1029,24 @@ class WashUpgrade(_PluginBase):
         """详情页：海报 + 当前版本的一览式卡片，尽量少文字。"""
         mode_text = "原生最佳版本" if self._wash_mode == _MODE_NATIVE else "自定义类别打分"
         nodes: list[dict] = [self._trigger_card()]
+        if self._running:
+            nodes.append({
+                "component": "VAlert",
+                "props": {
+                    "type": "info",
+                    "variant": "tonal",
+                    "class": "mb-3",
+                    "text": "正在洗版中（后台执行，一个一个订阅处理，期间会持续产生日志）。"
+                            "处理完之前请勿重复点按钮，否则会被忽略。",
+                },
+            })
         nodes.append({
             "component": "VCardText",
             "props": {"class": "pa-0 px-1 pb-3 text-caption text-medium-emphasis"},
             "text": (
                 f"{'运行中' if self._enabled else '已停用'} · {mode_text} · "
                 f"{'试运行' if self._dry_run else '正式'} · 间隔 {self._interval_seconds}s · "
-                f"每轮 {self._batch_limit or '不限'} · 冷却 {self._cooldown_hours}h · "
+                f"单次 {(str(self._batch_limit) + ' 个') if self._batch_limit else '全部'} · 冷却 {self._cooldown_hours}h · "
                 f"洗到 {self._ceiling_text()} 停 · 最多洗 {self._max_wash_times or '不限'} 次"
             ),
         })
@@ -1088,10 +1102,14 @@ class WashUpgrade(_PluginBase):
             "props": {"class": "pa-0 px-1 pt-3 text-caption text-medium-emphasis"},
             "text": f"上次运行：{self._last_run}",
         })
-        recent = list(reversed(self._activities[-8:]))
+        recent = list(reversed(self._activities[-30:]))
         nodes.append({
             "component": "VCard",
-            "props": {"variant": "outlined", "class": "mt-2"},
+            "props": {
+                "variant": "outlined",
+                "class": "mt-2",
+                "title": f"运行记录（共 {len(self._activities)} 条，显示最近 {len(recent)} 条）",
+            },
             "content": [
                 {
                     "component": "VList",
@@ -1440,7 +1458,10 @@ class WashUpgrade(_PluginBase):
             if i < total - 1:
                 self._pace(i + 1, total)
 
+        left = self._to_int(self.__dict__.get("_batch_left", 0), 0, 0, 10 ** 6)
         self._last_run = f"{mode_text}洗版完成，处理 {total} 个订阅"
+        if left:
+            self._last_run += f"，还剩 {left} 个未处理（再点一次「立即洗版一次」会接着洗）"
         self._record(self._last_run)
         self._stats()["processed"] = total
         self._notice_summary()
@@ -1472,16 +1493,28 @@ class WashUpgrade(_PluginBase):
         return kept
 
     def _apply_batch(self, targets: list[tuple[int, Any]]) -> list[tuple[int, Any]]:
-        """每轮最多处理 N 个订阅，按轮转游标取，保证长期都能轮到。"""
+        """单次运行最多处理 N 个订阅，其余下次从「上次最后一个」之后继续。
+
+        游标按订阅 id 记，不按列表下标——冷却会把部分订阅过滤掉、列表长度每轮都变，
+        用下标续接会错位，导致某些订阅永远轮不到。
+        """
         limit = self._batch_limit
-        if limit <= 0 or len(targets) <= limit:
+        need = len(targets)
+        self._batch_left = 0
+        if limit <= 0 or need <= limit:
+            self._cursor_sid = None
             return targets
-        start = self._cursor % len(targets)
+
+        sids = [sid for sid, _ in targets]
+        last = self.__dict__.get("_cursor_sid")
+        start = (sids.index(last) + 1) % need if last in sids else 0
         rotated = targets[start:] + targets[:start]
         picked = rotated[:limit]
-        self._cursor = (start + limit) % len(targets)
+        self._cursor_sid = picked[-1][0]
+        self._batch_left = need - limit
         self._record(
-            f"分批限流：共 {len(targets)} 个订阅，本轮只处理 {limit} 个（下次从第 {self._cursor + 1} 个继续）"
+            f"分批限流：本次可洗 {need} 个，只处理前 {limit} 个，还剩 {need - limit} 个下次继续"
+            f"（想一次跑完，把「单次运行最多处理订阅数」设为 0）"
         )
         return picked
 
